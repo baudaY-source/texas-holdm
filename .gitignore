@@ -1,0 +1,39 @@
+.venv/
+.worktrees/
+__pycache__/
+*.pyc
+.pytest_cache/
+# TexasSolver 运行产物
+output_result*.json
+# 第三方二进制(体积大,按 third_party/texassolver/SOURCE.md 自行下载)
+third_party/texassolver/TexasSolver-v0.2.0-Windows/
+# 离线训练产物
+nets/checkpoints/
+# 模拟器手牌历史产物
+hands/
+
+# M5 训练场产物
+gto/work/
+training/scenarios/
+
+# M7 训练档案与打包产物(texasholdem.spec 为构建配方,须提交)
+training/profile.json
+build/
+dist/
+# 截图走查产物（夹具随输出目录生成）
+out_shots/
+out_shots_main/
+out_shots_exe/
+
+# Android WSL 可行性支线本机构建产物
+android/.build-venv/
+android/.build-home/
+android/artifacts/
+android/build_logs/
+android/probe/.buildozer/
+android/probe/bin/
+wsl_android_start/
+
+# 本地稳定版归档（大文件不进 Git）
+release/
+local_backups/

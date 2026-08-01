@@ -1,0 +1,6 @@
+# 酒馆德州 Windows 运行与打包依赖（Python 3.12）
+# 发行版使用纯 Python 轻量 NFSP 权重，不需要 torch / rlcard / numpy。
+pokerkit==0.7.4
+phevaluator==0.6.0
+pygame-ce==2.5.7
+pyinstaller==6.21.0
