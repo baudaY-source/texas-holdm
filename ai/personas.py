@@ -25,7 +25,7 @@ class Persona:
 
 
 def persona_catalog(seed: int | None = None) -> tuple[Persona, ...]:
-    """返回九名可选牌手；前五名保持原默认阵容及顺序。"""
+    """返回十五名可选牌手；原九名身份及顺序保持不变。"""
     rng = random.Random(seed)
     return (
         Persona(
@@ -108,6 +108,60 @@ def persona_catalog(seed: int | None = None) -> tuple[Persona, ...]:
             level="reg",
             persona_id="wolf",
             style_key="MANIAC",
+        ),
+        Persona(
+            display_name="棕熊 Borin",
+            species="棕熊",
+            backstory="北岭伐木场的旧领班，掌心能盖住一摞筹码；他不急着亮爪，只等底池长到值得抱走。",
+            style=styles.loose_passive(rng),
+            level="reg",
+            persona_id="bear",
+            style_key="CALLER",
+        ),
+        Persona(
+            display_name="雄狮 Aurelio",
+            species="狮子",
+            backstory="没落马戏团的前领班，鬃毛里还别着一枚铜徽章；他把每次加注都当作巡视自己的领地。",
+            style=styles.tight_aggressive(rng),
+            level="shark",
+            persona_id="lion",
+            style_key="TAG",
+        ),
+        Persona(
+            display_name="猛虎 Raka",
+            species="老虎",
+            backstory="从雨林河港一路赌到这里的独行客，指节上的旧伤比筹码更多；一闻到软弱就会连扑三街。",
+            style=styles.loose_aggressive(rng),
+            level="shark",
+            persona_id="tiger",
+            style_key="LAG",
+        ),
+        Persona(
+            display_name="老龟 Moss",
+            species="乌龟",
+            backstory="地下酒窖的看守，见过的牌局比酒桶年轮还多；他把筹码缩在壳边，只从最安全的缝隙伸手。",
+            style=styles.tight_passive(rng),
+            level="reg",
+            persona_id="turtle",
+            style_key="ROCK",
+        ),
+        Persona(
+            display_name="夜枭 Orin",
+            species="猫头鹰",
+            backstory="旧法院的夜班书记员，灯熄之后仍能听出谁在撒谎；他安静记录节奏，再在最深的夜里翻开答案。",
+            style=styles.mixed_baseline(rng),
+            level="shark",
+            persona_id="owl",
+            style_key="MIX",
+        ),
+        Persona(
+            display_name="黑豹 Nyx",
+            species="黑豹",
+            backstory="无灯巷里的情报贩子，从没人听见她靠近牌桌；小底池里只留一道影子，大底池里才露出獠牙。",
+            style=styles.small_ball(rng),
+            level="shark",
+            persona_id="panther",
+            style_key="SMALL",
         ),
     )
 

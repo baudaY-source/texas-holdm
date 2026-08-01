@@ -157,6 +157,9 @@ class TableScene(Scene):
         (供「回顾/统计」场景消费);缺省 = 非 headless。
     :param buyins_bb: 各座位开局买入(BB)，元组长度即游玩人数；
         缺省为六人、每席 100BB。
+    :param opponent_lineup: 可选的显式 AI 阵容，依座位顺序给出
+        ``((persona_id, style_key), ...)``；长度必须等于玩家数减一，身份不可
+        重复。缺省保持旧行为，按目录前 N 名装配默认阵容。
     :param use_nfsp: 是否加载发行包内的轻量 NFSP 推理模型。
     :param nfsp_model_path: 自定义轻量模型路径；缺省读取 ``assets/models``。
     :param nfsp_policy: 测试/嵌入用的已加载策略对象，全桌 AI 共享同一实例。
@@ -175,6 +178,7 @@ class TableScene(Scene):
         board_script: list[str] | None = None,
         record_history: bool | None = None,
         buyins_bb: tuple[int, ...] | None = None,
+        opponent_lineup: tuple[tuple[str, str], ...] | None = None,
         use_nfsp: bool = True,
         nfsp_model_path: str | Path | None = None,
         nfsp_policy: object | None = None,
@@ -205,6 +209,7 @@ class TableScene(Scene):
         if not MIN_PLAYERS <= len(self.buyins_bb) <= MAX_PLAYERS:
             raise ValueError(f"游玩人数须在 {MIN_PLAYERS}–{MAX_PLAYERS} 之间")
         self.player_count = len(self.buyins_bb)
+        self.opponent_lineup = self._validate_opponent_lineup(opponent_lineup)
         self._seat_anchors = _seat_layout(self.player_count)
         self._portrait_scale = (
             0.66 if self.player_count >= 8 else 0.76 if self.player_count == 7 else 0.95
@@ -299,8 +304,37 @@ class TableScene(Scene):
 
     # ------------------------------------------------------------ 牌局装配
 
+    def _validate_opponent_lineup(
+        self,
+        lineup: tuple[tuple[str, str], ...] | None,
+    ) -> tuple[tuple[str, str], ...] | None:
+        """校验并标准化开局页传入的身份/打法阵容。"""
+        if lineup is None:
+            return None
+        normalized = tuple(
+            (str(persona_id).strip().lower(), str(style_key).strip().upper())
+            for persona_id, style_key in lineup
+        )
+        expected = self.player_count - 1
+        if len(normalized) != expected:
+            raise ValueError(f"AI 阵容须恰好包含 {expected} 名牌手")
+        persona_ids = {persona.persona_id for persona in persona_catalog(self.seed)}
+        style_keys = {preset.key for preset in style_catalog()}
+        chosen_ids = [persona_id for persona_id, _ in normalized]
+        if len(set(chosen_ids)) != len(chosen_ids):
+            raise ValueError("AI 阵容中的身份不可重复")
+        unknown_personas = sorted(set(chosen_ids) - persona_ids)
+        if unknown_personas:
+            raise ValueError(f"未知 AI 身份: {unknown_personas}")
+        unknown_styles = sorted(
+            {style_key for _, style_key in normalized} - style_keys
+        )
+        if unknown_styles:
+            raise ValueError(f"未知 AI 打法: {unknown_styles}")
+        return normalized
+
     def new_game(self) -> None:
-        """开一桌新局:人类 + 按人数截取的具名 AI,各就各位。
+        """开一桌新局:人类 + 已配置的具名 AI,各就各位。
 
         种子随局数递增,避免「重新买入」后牌序与上一局完全一致。
         """
@@ -308,9 +342,31 @@ class TableScene(Scene):
         self._game_no += 1
         self._persona_catalog = persona_catalog(gseed)
         self._style_catalog = style_catalog()
-        self.personas: list[Persona] = list(
-            self._persona_catalog[: self.player_count - 1]
-        )
+        if self.opponent_lineup is None:
+            self.personas = list(self._persona_catalog[: self.player_count - 1])
+        else:
+            by_id = {
+                persona.persona_id: persona for persona in self._persona_catalog
+            }
+            self.personas = []
+            for seat, (persona_id, style_key) in enumerate(
+                self.opponent_lineup,
+                start=1,
+            ):
+                base = by_id[persona_id]
+                style_seed = (
+                    None
+                    if gseed is None
+                    else gseed * 1009 + seat * 37
+                )
+                self.personas.append(
+                    with_style(
+                        base,
+                        style_key,
+                        seed=style_seed,
+                        level=base.level,
+                    )
+                )
         names = ("你",) + tuple(p.display_name for p in self.personas)
         cfg = TableConfig.from_buyins_bb(
             player_count=self.player_count,
@@ -2184,6 +2240,14 @@ class _SeatJoinDialog:
         pending = scene._pending_joins.get(seat)
         current = scene.personas[seat - 1]
         self.persona_id = pending.persona_id if pending else current.persona_id
+        if self.persona_id in self.occupied:
+            # 原身份可能已被另一个空位预约；打开面板时直接落到第一名
+            # 可用角色，避免默认选中禁用按钮、还要用户额外排查原因。
+            self.persona_id = next(
+                persona.persona_id
+                for persona in self.catalog
+                if persona.persona_id not in self.occupied
+            )
         self.style_picker = _StylePicker(
             scene,
             (650, 258),
@@ -2198,14 +2262,14 @@ class _SeatJoinDialog:
         self.identity_btns = [
             Button(
                 (
-                    142 + (index % 3) * 146,
-                    210 + (index // 3) * 48,
-                    136,
-                    39,
+                    142 + (index % 5) * 88,
+                    210 + (index // 5) * 44,
+                    80,
+                    36,
                 ),
                 persona.display_name.split()[-1],
                 lambda key=persona.persona_id: self._select_persona(key),
-                size=15,
+                size=13,
                 enabled=persona.persona_id not in self.occupied,
             )
             for index, persona in enumerate(self.catalog)

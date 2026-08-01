@@ -147,11 +147,21 @@ def shot_menu(path: Path) -> None:
 
 
 def shot_game_setup(path: Path) -> None:
-    """九人桌设置：人数、逐席买入和 UTG straddle 提示同屏。"""
+    """九人已选满：新角色、自定义打法/买入与 straddle 同屏。"""
     scene = GameSetupScene(
         seed=SEED,
         initial_buyins_bb=(100, 80, 150, 50, 200, 120, 75, 125, 180),
         player_count=9,
+        initial_lineup=(
+            ("panther", "LAG"),
+            ("owl", "MIX"),
+            ("bear", "ROCK"),
+            ("tiger", "MANIAC"),
+            ("turtle", "SMALL"),
+            ("lion", "TAG"),
+            ("raven", "BAL"),
+            ("rabbit", "CALLER"),
+        ),
     )
     _step(scene, 2.0)
     _render(scene, path)
@@ -464,7 +474,7 @@ def shot_empty_seat_join(path: Path) -> None:
         )
     )
     assert scene._seat_dialog is not None, "点击空位未打开召回面板"
-    scene._seat_dialog._select_persona("raven")
+    scene._seat_dialog._select_persona("panther")
     scene._seat_dialog.style_picker.select("MIX")
     _render(scene, path)
 

@@ -37,10 +37,25 @@ SPECIES_KEY = {
     "兔子": "rabbit",
     "狼": "wolf",
     "灰狼": "wolf",
+    "熊": "bear",
+    "棕熊": "bear",
+    "狮子": "lion",
+    "雄狮": "lion",
+    "老虎": "tiger",
+    "虎": "tiger",
+    "乌龟": "turtle",
+    "龟": "turtle",
+    "猫头鹰": "owl",
+    "夜枭": "owl",
+    "黑豹": "panther",
+    "豹": "panther",
 }
 
 PORTRAIT_KEYS = frozenset(
-    ("bull", "fox", "rhino", "boar", "dog", "cat", "raven", "rabbit", "wolf")
+    (
+        "bull", "fox", "rhino", "boar", "dog", "cat", "raven", "rabbit", "wolf",
+        "bear", "lion", "tiger", "turtle", "owl", "panther",
+    )
 )
 
 LEVEL_LABEL = {"fish": "新手", "reg": "常客", "shark": "鲨鱼"}
