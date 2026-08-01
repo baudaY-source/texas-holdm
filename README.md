@@ -77,6 +77,28 @@ python -m venv .venv
 - Drills 训练进度位于 `training/profile.json`，训练场用户场景、NFSP 模型、
   GTO 策略库及构建备份均不属于牌局清除范围。
 
+## 朋友联机 Alpha（开发中）
+
+本仓库已经包含首个后端会合点 `mp-v1-alpha1`：严格 JSON v1、安全个人视角
+投影、2–9 人权威 `RoomCore`、串行 actor，以及仅监听 localhost 的 WebSocket
+服务。真实双客户端已经跑通创建/加入、准备开局、弃牌结算、全下摊牌、命令
+幂等和 token 恢复替换。
+
+现有 Windows EXE 与 Android APK 仍保持离线单机；尚未接入联机 UI、分阶段动画
+事件或公网 WSS。协议金额、可见性、幂等和当前限制见
+[`docs/MULTIPLAYER_PROTOCOL_V1.md`](docs/MULTIPLAYER_PROTOCOL_V1.md)。
+
+只做本机协议联调时，可在独立环境安装服务端依赖并启动：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-server.txt
+.venv\Scripts\python.exe -m multiplayer_server --port 8765
+```
+
+服务只绑定 `127.0.0.1`。手机朋友局必须由后续部署层提供正式 `wss://`，不能
+把 localhost 的明文 `ws://` 地址直接暴露到公网。服务端依赖与桌面 EXE、Android
+APK 的依赖保持分离。
+
 ## 可选实时求解器
 
 主游戏、GTO 图表、内置策略、Drills 和示例解无需 TexasSolver 即可使用。
@@ -110,6 +132,8 @@ torch、rlcard 或 numpy。
 
 ```
 engine/     牌桌引擎(pokerkit 封装)与 JSONL 手牌历史
+multiplayer/ JSON v1、认证、安全视角投影、RoomCore 与串行 actor
+multiplayer_server/ 可选 localhost WebSocket 服务与房间注册
 ai/         十五身份/八打法/对白/启发式机器人、最佳牌型分析、HU NFSP 轻量运行时与安全路由、竞技场
 gto/        翻前图表、策略库与可选求解器桥
 training/   训练场场景、快速分析、drills 引擎、回顾/统计纯逻辑
@@ -117,7 +141,8 @@ ui/         主题/控件/牌面/角色/特效、买入设置及牌桌/图表/�
 assets/     高清牌面、十五张动物酒馆肖像、版本化 NFSP 轻量推理权重
 third_party/texassolver/  TexasSolver v0.2.0 下载与许可说明
 hands/      手牌历史与竞技场统计(运行产物)
-tools/      截图验收与 Windows 打包脚本
+tools/      截图验收、Windows 打包与联机命令行客户端
+docs/       朋友联机协议与当前实现边界
 tests/fixtures/  训练页内置示例解（不是完整测试集）
 ```
 

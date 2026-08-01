@@ -10,6 +10,7 @@
 | SDL | pygame-ce 使用的跨平台底层库 | Zlib；<https://github.com/libsdl-org/SDL> |
 | PokerKit | 德州状态机 | MIT；<https://github.com/uoftcprg/pokerkit> |
 | phevaluator | 手牌评估 | Apache-2.0；<https://github.com/HenryRLee/PokerHandEvaluator> |
+| websockets 16.1.1 | 可选朋友局 localhost 服务端，不进入桌面 EXE / Android APK | BSD-3-Clause；<https://websockets.readthedocs.io/en/16.1.1/> |
 | gto-poker-overlay 数据 | 翻前 RFI/HU/推弃图表 | MIT；<https://github.com/hellomate2/gto-poker-overlay>；另见 `gto/charts/SOURCE.md` |
 | Adrian Kennard Super Index Playing Cards | 当前高清牌面素材 | CC0；<https://www.me.uk/cards/>；生成参数与下载哈希见 `assets/cards/clarity/SOURCE.md` |
 | Python / PyInstaller | Python 运行时与冻结工具 | PSF / GPL bootloader exception；<https://www.python.org/psf/license/>、<https://pyinstaller.org/en/stable/license.html> |

@@ -7,7 +7,8 @@
 
 - 数据:assets（含约 1.18MB 的 NFSP 轻量推理权重）/ gto 图表与策略库 /
   TexasSolver 二进制 / 训练场示例解夹具;
-- 排除 torch / rlcard / nets / numpy:仅离线训练与完整 checkpoint 推理用;
+- 排除 torch / rlcard / nets / numpy 以及独立的 WebSocket 服务端：这些均不
+  属于离线桌面 EXE;
   游戏改由 ``ai.nfsp_runtime`` 的纯标准库运行时读取轻量权重;
 - 可写数据(手牌历史、训练档案、用户场景、求解器 scratch)由
   ``ui.respath.user_data_root()`` 落到 exe 同级目录,不进 _MEIPASS。
@@ -88,6 +89,8 @@ a = Analysis(
         "scipy",
         "PIL",
         "pytest",
+        "websockets",
+        "multiplayer_server",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

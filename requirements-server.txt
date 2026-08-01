@@ -1,0 +1,5 @@
+# 《酒馆德州》朋友联机权威服务器的最小依赖。
+# 与桌面 requirements.txt、Windows EXE 及 Android 构建严格分离。
+pokerkit==0.7.4
+phevaluator==0.6.0
+websockets==16.1.1
