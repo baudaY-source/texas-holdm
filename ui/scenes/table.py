@@ -2,10 +2,9 @@
 
 流程状态机:``deal``(发牌动画)→ ``action``(人类/AI 轮流行动,
 AI 有 0.6-1.2s 思考延迟)→ 街道切换时 ``streetdeal``(公共牌动画)
-→ 全下跑码 ``runout``(快速发完剩余公共牌)→ ``finish``(摊牌亮牌、
-胜者横幅、筹码飞向胜者、下一手)。ESC 呼出暂停菜单。
-有玩家出局时 ``finish`` 先弹出处置模态框(重新买入/移出牌桌),
-全部处置完才允许进入下一手。
+→ 全下跑码 ``runout``(发完剩余公共牌)→ ``showdown_reveal``(翻开
+摊牌底牌)→ ``finish``(逐池结算、筹码推向胜者、下一手)。ESC 呼出
+暂停菜单。有玩家出局时，必须完整展示摊牌与派彩后才弹出处置模态框。
 """
 from __future__ import annotations
 
@@ -50,7 +49,12 @@ TABLE_C = (615, 460)
 FELT_RX, FELT_RY = 480, 270
 DECK_POS = (1000, 500)
 BOARD_Y = 460
+POT_CHIP_POS = (TABLE_C[0], BOARD_Y - 105)
 PANEL_X = 1225
+
+SHOWDOWN_FLIP_SECONDS = 0.34
+SHOWDOWN_REVEAL_SECONDS = 1.15
+BUST_RESULT_SECONDS = 2.2
 
 # GTO 面板三条频率条的配色:弃牌灰红、过牌/跟注青、下注/加注琥珀
 _GTO_FOLD_C = (150, 84, 72)
@@ -261,7 +265,11 @@ class TableScene(Scene):
         self._settled_holes: dict[int, int] = {}
         self._acted: set[int] = set()
         self.reveal = False
+        self._showdown_reveal_progress = 1.0
         self.banner: tuple[str, str] | None = None  # (主标题, 副标题)
+        self._last_settlement_lines: tuple[str, ...] = ()
+        self._final_pot_amount = 0
+        self._payout_departed = False
         self.snap: GameSnapshot | None = None
         # 出局处置/空位重入:强制 bust 框优先于可取消的召回框。
         self._removed_seats: set[int] = set()
@@ -385,6 +393,7 @@ class TableScene(Scene):
             self._install_persona(seat, persona)
         self._hint_cache.clear()
         self.log.clear()
+        self.chipfly.clear()
         self._removed_seats = set()
         self._bust_queue = []
         self._bust_dialog = None
@@ -392,6 +401,10 @@ class TableScene(Scene):
         self._pending_joins = {}
         self._speech_bubbles = []
         self._menu_toast = None
+        self._last_settlement_lines = ()
+        self._final_pot_amount = 0
+        self._payout_departed = False
+        self._showdown_reveal_progress = 1.0
         buyin_summary = (
             f"统一 {self.buyins_bb[0]}BB"
             if len(set(self.buyins_bb)) == 1
@@ -455,6 +468,9 @@ class TableScene(Scene):
         self._board_script = None
         self.banner = None
         self.reveal = False
+        self._showdown_reveal_progress = 1.0
+        self._final_pot_amount = 0
+        self._payout_departed = False
         self._raise_open = False
         self._visual_board = 0
         self._acted = set()
@@ -464,6 +480,7 @@ class TableScene(Scene):
         self._last_ai_detail = ""
         self.anim.clear()
         self.muck.clear()
+        self.chipfly.clear()
         self._action_echoes.clear()
         snap = self.table.snapshot(perspective=HUMAN_SEAT)
         self.snap = snap
@@ -532,6 +549,34 @@ class TableScene(Scene):
         reach = 190 if self.player_count >= 8 else 208
         return (anchor[0] + ux * reach, anchor[1] + uy * reach)
 
+    def _stack_chip_pos(self, seat: int) -> tuple[float, float]:
+        """返回角色桌前的静态筹码位，也作为下注/收池动画端点。"""
+        anchor = self._seat_anchors[seat]
+        if seat == HUMAN_SEAT:
+            return (anchor[0] + 146, anchor[1] - 72)
+        ux, uy = _unit_to_center(anchor)
+        px, py = -uy, ux
+        # 放在底牌与下注位之间并向一侧错开；不可贴近头像下沿，九人桌
+        # 顶部座位的姓名牌正位于那里。
+        reach = 150 if self.player_count >= 8 else 165
+        side = (48 if self.player_count >= 8 else 52) * (1 if seat % 2 else -1)
+        return (
+            anchor[0] + ux * reach + px * side,
+            anchor[1] + uy * reach + py * side,
+        )
+
+    def _display_stack(self, seat: int, settled_stack: int) -> int:
+        """派彩飞行完成前暂缓把奖金计入桌面筹码堆。"""
+        result = self.table.last_hand_result
+        if result is None or not self.table.hand_over:
+            return settled_stack
+        staging = self.phase in ("runout", "showdown_reveal") or (
+            self.phase == "finish" and self.chipfly.busy_for("payout")
+        )
+        if not staging:
+            return settled_stack
+        return max(0, settled_stack - result.winners.get(seat, 0))
+
     # ------------------------------------------------------------ 事件
 
     def handle_event(self, ev: pygame.event.Event) -> None:
@@ -591,6 +636,8 @@ class TableScene(Scene):
 
     def _handle_empty_seat_event(self, ev: pygame.event.Event) -> bool:
         """点空位或已预约座位时打开召回/编辑面板。"""
+        if self._bust_queue:
+            return False
         if ev.type != pygame.MOUSEBUTTONUP or ev.button != 1:
             return False
         for seat in sorted(self.table.removed_seats):
@@ -685,13 +732,42 @@ class TableScene(Scene):
         FOLD 的牌面素材必须在 ``table.apply`` 前捕获；动作应用后快照
         可能隐藏底牌，届时再取会只剩状态而没有可供丢牌的图像。
         """
-        name = self.snap.players[action.seat].name if self.snap else f"seat{action.seat}"
+        before = self.snap
+        name = before.players[action.seat].name if before else f"seat{action.seat}"
+        before_bet = before.players[action.seat].bet if before else 0
+        if action.action_type is ActionType.CALL:
+            paid = action.amount
+        elif action.action_type in (
+            ActionType.BET,
+            ActionType.RAISE,
+            ActionType.ALLIN,
+        ):
+            paid = max(0, action.amount - before_bet)
+        else:
+            paid = 0
+        collected_bets = (
+            {player.seat: player.bet for player in before.players}
+            if before is not None
+            else {}
+        )
+        if paid:
+            collected_bets[action.seat] = before_bet + paid
         fold_visuals = (
             self._capture_fold_visuals(action.seat)
             if action.action_type is ActionType.FOLD
             else []
         )
         self.table.apply(action)
+        if paid:
+            self.chipfly.launch_amount(
+                self._stack_chip_pos(action.seat),
+                self._bet_pos(action.seat),
+                paid,
+                rng=self.rng,
+                group="wager",
+                min_chips=2,
+                max_chips=14,
+            )
         if fold_visuals:
             self.muck.launch(fold_visuals, _MUCK_POS, action.seat)
         self._acted.add(action.seat)
@@ -713,7 +789,11 @@ class TableScene(Scene):
             )
         )
         self._raise_open = False
-        self._sync_snapshot()
+        self._sync_snapshot(
+            previous=before,
+            collected_bets=collected_bets,
+            wager_delay=0.56 if paid else 0.0,
+        )
 
     def _capture_fold_visuals(
         self, seat: int
@@ -741,19 +821,53 @@ class TableScene(Scene):
             )
         return visuals
 
-    def _sync_snapshot(self) -> None:
+    def _sync_snapshot(
+        self,
+        *,
+        previous: GameSnapshot | None = None,
+        collected_bets: dict[int, int] | None = None,
+        wager_delay: float = 0.0,
+    ) -> None:
         """动作后重新取快照,检测街道推进与手牌结束。"""
         snap = self.table.snapshot(perspective=HUMAN_SEAT)
         prev_board = self._visual_board
         self.snap = snap
+        street_advanced = previous is not None and previous.street is not snap.street
+        if collected_bets and (street_advanced or self.table.hand_over):
+            required = sum(collected_bets.values())
+            if self.table.hand_over and self.table.last_hand_result is not None:
+                final_total = sum(
+                    pot.amount for pot in self.table.last_hand_result.pots
+                )
+                required = max(0, final_total - (previous.total_pot if previous else 0))
+            visual_bets = self._collectable_bets(collected_bets, required)
+            for seat, amount in visual_bets.items():
+                if amount <= 0:
+                    continue
+                self.chipfly.launch_amount(
+                    self._bet_pos(seat),
+                    POT_CHIP_POS,
+                    amount,
+                    rng=self.rng,
+                    delay=wager_delay,
+                    group="collect",
+                    min_chips=2,
+                    max_chips=12,
+                )
         if len(snap.board) > self._visual_board:
-            self._deal_board_anims(snap.board[self._visual_board :])
+            self._deal_board_anims(
+                snap.board[self._visual_board :],
+                runout=self.table.hand_over,
+            )
             self._visual_board = len(snap.board)
         if self.table.hand_over:
+            result = self.table.last_hand_result
+            assert result is not None
+            self._final_pot_amount = sum(pot.amount for pot in result.pots)
             if len(snap.board) > prev_board and self.anim.busy:
                 self.phase = "runout"
             else:
-                self._enter_finish()
+                self._enter_showdown_reveal() if result.showdown else self._enter_finish()
         elif len(snap.board) > prev_board:
             self._acted = set()
             self.log.add(f"—— {STREET_LABEL[snap.street]} ——")
@@ -761,7 +875,28 @@ class TableScene(Scene):
             self._phase_t = 0.0
         # 同一街道继续行动则保持 action 阶段
 
-    def _deal_board_anims(self, new_codes: tuple[str, ...]) -> None:
+    @staticmethod
+    def _collectable_bets(
+        bets: dict[int, int],
+        required_total: int,
+    ) -> dict[int, int]:
+        """扣除未跟注返还，得到真正汇入最终底池的本街筹码。"""
+        result = {seat: max(0, amount) for seat, amount in bets.items()}
+        excess = max(0, sum(result.values()) - max(0, required_total))
+        for seat in sorted(result, key=lambda value: result[value], reverse=True):
+            if excess <= 0:
+                break
+            returned = min(excess, result[seat])
+            result[seat] -= returned
+            excess -= returned
+        return result
+
+    def _deal_board_anims(
+        self,
+        new_codes: tuple[str, ...],
+        *,
+        runout: bool = False,
+    ) -> None:
         start_idx = self._visual_board
         for i, code in enumerate(new_codes):
             x = TABLE_C[0] + (start_idx + i - 2) * 70
@@ -770,7 +905,7 @@ class TableScene(Scene):
                 cards.card_surface("back", cards.SIZE_BOARD),
                 DECK_POS,
                 (x, BOARD_Y),
-                delay=0.14 * i if self.phase != "runout" else 0.24 * i,
+                delay=(0.24 if runout else 0.14) * i,
                 duration=0.3,
                 face_up=True,
                 flip=True,
@@ -778,25 +913,107 @@ class TableScene(Scene):
 
     # ------------------------------------------------------------ 结算
 
+    def _enter_showdown_reveal(self) -> None:
+        """公共牌落定后先无遮挡翻开底牌，再进入派彩横幅。"""
+        result = self.table.last_hand_result
+        assert result is not None and result.showdown
+        self.reveal = True
+        self.banner = None
+        self.phase = "showdown_reveal"
+        self._phase_t = 0.0
+        self._showdown_reveal_progress = 0.0
+        self.log.add("—— 摊牌 · 亮牌 ——")
+
     def _enter_finish(self) -> None:
         res = self.table.last_hand_result
         assert res is not None
         self.reveal = res.showdown
-        names = "、".join(self.table_snapshot_name(s) for s in res.winners)
-        total = sum(res.winners.values())
-        if res.showdown:
-            self.banner = (f"{names} 赢得 {total}", "摊牌")
-        else:
-            self.banner = (f"{names} 赢得 {total}", "其他玩家弃牌")
-        self.log.add(f"🏆 {names} +{total}" if False else f"» {names} 赢得 {total}")
+        self._showdown_reveal_progress = 1.0
+        self._final_pot_amount = sum(pot.amount for pot in res.pots)
+        self._last_settlement_lines = self._build_settlement_lines(res)
+        for line in self._last_settlement_lines:
+            self.log.add(f"» {line}")
+        self.banner = self._settlement_banner(res)
         self.phase = "finish"
         self._phase_t = 0.0
-        for seat in res.winners:
-            self.chipfly.launch(
-                (TABLE_C[0], BOARD_Y), self._seat_anchors[seat], count=7, rng=self.rng
-            )
+        self._payout_departed = False
+        payout_delay = self.chipfly.remaining + 0.10
+        for award_index, award in enumerate(res.pot_awards):
+            for payout_index, (seat, amount) in enumerate(award.payouts):
+                self.chipfly.launch_amount(
+                    POT_CHIP_POS,
+                    self._stack_chip_pos(seat),
+                    amount,
+                    rng=self.rng,
+                    delay=payout_delay + award_index * 0.14 + payout_index * 0.06,
+                    group="payout",
+                    min_chips=3,
+                    max_chips=16,
+                )
         self._prepare_table_talk(res)
         self._collect_busts()
+
+    def _ending_street_label(self) -> str:
+        """返回最后一次真实行动所在街道，供未摊牌结果叙述。"""
+        actions = self.table.last_actions
+        if not actions:
+            return "翻牌前"
+        try:
+            return STREET_LABEL[Street[str(actions[-1]["street"])]]
+        except (KeyError, TypeError):
+            return "本手"
+
+    def _winner_hand_label(self, seat: int, res: HandResult) -> str:
+        """只在摊牌后从人类可见快照计算赢家牌型。"""
+        if not res.showdown or self.snap is None:
+            return ""
+        hole = self.snap.players[seat].hole_cards
+        if hole is None:
+            return ""
+        return describe_holdem_hand(hole, res.board).label
+
+    def _build_settlement_lines(self, res: HandResult) -> tuple[str, ...]:
+        """构造第几手、是否摊牌、逐池赢家/牌型/金额的完整叙述。"""
+        total = sum(pot.amount for pot in res.pots)
+        mode = "摊牌" if res.showdown else f"{self._ending_street_label()}未摊牌"
+        lines = [f"第 {res.hand_id} 手 · {mode} · 总池 ¢{total}"]
+        for award in res.pot_awards:
+            pool = "主池" if award.pot_index == 0 else f"边池 {award.pot_index}"
+            for seat, amount in award.payouts:
+                name = self.table_snapshot_name(seat)
+                if res.showdown:
+                    hand = self._winner_hand_label(seat, res) or "最佳牌"
+                    verb = "分得" if len(award.payouts) > 1 else "赢得"
+                    lines.append(
+                        f"{pool} ¢{award.pot.amount}：{name}以{hand}{verb} ¢{amount}"
+                    )
+                else:
+                    lines.append(
+                        f"{pool} ¢{award.pot.amount}：{name}未摊牌收池 ¢{amount}"
+                    )
+        return tuple(lines)
+
+    def _settlement_banner(self, res: HandResult) -> tuple[str, str]:
+        """从逐池明细提炼牌桌中央的一行结果。"""
+        total = sum(pot.amount for pot in res.pots)
+        names = "、".join(self.table_snapshot_name(seat) for seat in res.winners)
+        if len(res.winners) == 1:
+            seat = next(iter(res.winners))
+            title = f"{names} 赢得 ¢{res.winners[seat]}"
+            if res.showdown:
+                detail = self._winner_hand_label(seat, res) or "最佳牌"
+                sub = f"第 {res.hand_id} 手 · 摊牌 · {detail} · 底池 ¢{total}"
+            else:
+                sub = (
+                    f"第 {res.hand_id} 手 · {self._ending_street_label()}未摊牌"
+                    f" · 底池 ¢{total}"
+                )
+            return title, sub
+        return (
+            f"{names} 分得总池 ¢{total}",
+            f"第 {res.hand_id} 手 · {'摊牌' if res.showdown else '未摊牌'}"
+            " · 主池/边池详见右侧",
+        )
 
     def _prepare_table_talk(self, res: HandResult) -> None:
         """按结算与动作线排队人格对白；只在手牌结束后读取完整牌。"""
@@ -868,20 +1085,23 @@ class TableScene(Scene):
     # ------------------------------------------------------------ 出局处置(M8)
 
     def _collect_busts(self) -> None:
-        """结算后收集新出局的座位,排队弹处置框(人类优先,AI 按座位号)。"""
+        """只排队新出局座位；派彩演出完成后才真正打开模态框。"""
         busted = self.table.busted_seats
-        self._bust_queue = [s for s in busted if s != HUMAN_SEAT]
+        self._bust_queue = (
+            ([HUMAN_SEAT] if HUMAN_SEAT in busted else [])
+            + [seat for seat in busted if seat != HUMAN_SEAT]
+        )
         self._bust_dialog = None
-        if HUMAN_SEAT in busted:
-            self._bust_dialog = _BustDialog(self, HUMAN_SEAT)
-        elif self._bust_queue:
+
+    def _open_next_bust_dialog(self) -> None:
+        """在结果已清晰展示后打开下一项强制出局处置。"""
+        if self._bust_dialog is None and self._bust_queue:
             self._bust_dialog = _BustDialog(self, self._bust_queue.pop(0))
 
     def _advance_bust_queue(self) -> None:
         """当前处置完毕,弹出下一个待处理 AI(若有)。"""
         self._bust_dialog = None
-        if self._bust_queue:
-            self._bust_dialog = _BustDialog(self, self._bust_queue.pop(0))
+        self._open_next_bust_dialog()
 
     def _resolve_bust_rebuy(self, dlg: "_BustDialog") -> None:
         """按所选金额买回；AI 同时应用当前选中的打法。"""
@@ -990,7 +1210,11 @@ class TableScene(Scene):
     def _next_hand(self) -> None:
         if self.phase != "finish":
             return
-        if self._bust_dialog is not None or self._seat_dialog is not None:
+        if (
+            self._bust_dialog is not None
+            or self._bust_queue
+            or self._seat_dialog is not None
+        ):
             return  # 须先处置完所有出局座位
         self._apply_pending_joins()
         if self.table.game_over:
@@ -1042,6 +1266,8 @@ class TableScene(Scene):
         self.anim.update(dt)
         self.muck.update(dt)
         self.chipfly.update(dt)
+        if self.phase == "finish" and self.chipfly.started_for("payout"):
+            self._payout_departed = True
         for echo in self._action_echoes:
             echo.elapsed += dt
         self._action_echoes = [
@@ -1069,16 +1295,34 @@ class TableScene(Scene):
                 self._think_left = self._think_time()
         elif self.phase == "runout":
             if not self.anim.busy:
+                result = self.table.last_hand_result
+                assert result is not None
+                self._enter_showdown_reveal() if result.showdown else self._enter_finish()
+        elif self.phase == "showdown_reveal":
+            self._phase_t += dt
+            self._showdown_reveal_progress = min(
+                1.0,
+                self._phase_t / SHOWDOWN_FLIP_SECONDS,
+            )
+            if self._phase_t >= SHOWDOWN_REVEAL_SECONDS:
                 self._enter_finish()
         elif self.phase == "action":
             self._update_action(dt)
         elif self.phase == "finish":
             self._phase_t += dt
             if (
+                self._bust_queue
+                and self._phase_t >= BUST_RESULT_SECONDS
+                and not self.chipfly.busy
+            ):
+                self._open_next_bust_dialog()
+                return
+            if (
                 self.auto_next
-                and self._phase_t > 0.4
+                and self._phase_t > 0.8
                 and not self.chipfly.busy
                 and self._bust_dialog is None
+                and not self._bust_queue
             ):
                 self._next_hand()
 
@@ -1201,24 +1445,49 @@ class TableScene(Scene):
             surf = cards.card_surface(code, cards.SIZE_BOARD)
             x = TABLE_C[0] + (i - 2) * 70
             dst.blit(surf, surf.get_rect(center=(x, BOARD_Y)))
-        # apply() 会在摊牌/全弃时立即派彩；结算后不再短暂显示「底池 0」。
-        if not self.table.hand_over:
+        # 当前街下注留在各座位前；已收集部分在中央形成有面值的筹码堆。
+        # 引擎虽会即时派彩，UI 在亮牌/派彩动画前持续保留最终底池。
+        if self.table.hand_over:
+            pot = self._final_pot_amount
+            show_pile = self.phase in ("runout", "showdown_reveal") or (
+                self.phase == "finish" and not self._payout_departed
+            )
+            central_amount = pot if show_pile else 0
+        else:
             pot = self._pot_total()
+            central_amount = snap.total_pot
+        if central_amount > 0:
+            draw_chip_pile(
+                dst,
+                POT_CHIP_POS,
+                central_amount,
+                seed=97,
+                show_amount=False,
+                scale=0.86,
+                min_chips=5,
+                max_chips=18,
+            )
+        if pot > 0:
             theme.text(
                 dst,
-                f"底池 {pot}",
-                (TABLE_C[0], BOARD_Y - 64),
+                f"{'待结算底池' if self.table.hand_over and self.phase != 'finish' else '底池'} {pot}",
+                (TABLE_C[0], BOARD_Y - 77),
                 22,
                 theme.GOLD,
                 "center",
                 shadow=True,
             )
-            if len(snap.pots) > 1:
-                side = " / ".join(str(p.amount) for p in snap.pots)
+            pots = (
+                self.table.last_hand_result.pots
+                if self.table.hand_over and self.table.last_hand_result is not None
+                else snap.pots
+            )
+            if len(pots) > 1:
+                side = " / ".join(str(p.amount) for p in pots)
                 theme.text(
                     dst,
                     f"边池 {side}",
-                    (TABLE_C[0], BOARD_Y - 40),
+                    (TABLE_C[0], BOARD_Y - 55),
                     13,
                     theme.TEXT_DIM,
                     "center",
@@ -1370,18 +1639,19 @@ class TableScene(Scene):
                 if compact and " " in p.name
                 else p.name
             )
+            display_stack = self._display_stack(p.seat, p.stack)
             draw_name_plate(
                 dst,
                 plate,
                 plate_name,
-                p.stack,
+                display_stack,
                 level=self.personas[p.seat - 1].level,
                 active=is_turn,
                 busted=not in_hand,
                 status=(
-                    f"¢ {p.stack} · 已弃牌"
+                    f"¢ {display_stack} · 已弃牌"
                     if in_hand and p.folded
-                    else (f"¢ {p.stack} · 思考中…" if is_turn else None)
+                    else (f"¢ {display_stack} · 思考中…" if is_turn else None)
                 ),
                 status_color=(
                     _FOLD_STATUS_C
@@ -1447,18 +1717,19 @@ class TableScene(Scene):
         plate = pygame.Rect(0, 0, 220, 56)
         anchor = self._seat_anchors[HUMAN_SEAT]
         plate.center = (round(anchor[0]), round(anchor[1] - 18))
+        display_stack = self._display_stack(p.seat, p.stack)
         draw_name_plate(
             dst,
             plate,
             "你",
-            p.stack,
+            display_stack,
             active=(self.phase == "action" and p.seat == self.snap.acting_seat),
             busted=not in_hand,
             status=(
-                f"¢ {p.stack} · 已弃牌"
+                f"¢ {display_stack} · 已弃牌"
                 if in_hand and p.folded
                 else (
-                    f"¢ {p.stack} · 轮到你"
+                    f"¢ {display_stack} · 轮到你"
                     if self.phase == "action" and p.seat == self.snap.acting_seat
                     else None
                 )
@@ -1490,8 +1761,22 @@ class TableScene(Scene):
                 img = pygame.transform.rotate(surf, rot)
             else:
                 face_up = ((self.reveal and not p.folded) or shown) and p.hole_cards is not None
-                code = p.hole_cards[i] if face_up else "back"
-                surf = cards.card_surface(code, cards.SIZE_MINI)
+                if (
+                    face_up
+                    and not shown
+                    and self.phase == "showdown_reveal"
+                ):
+                    progress = self._showdown_reveal_progress
+                    code = p.hole_cards[i] if progress >= 0.5 else "back"
+                    surf = cards.card_surface(code, cards.SIZE_MINI)
+                    fold = max(0.035, abs(1.0 - progress * 2.0))
+                    surf = pygame.transform.smoothscale(
+                        surf,
+                        (max(2, round(surf.get_width() * fold)), surf.get_height()),
+                    )
+                else:
+                    code = p.hole_cards[i] if face_up else "back"
+                    surf = cards.card_surface(code, cards.SIZE_MINI)
                 img = pygame.transform.rotate(surf, -4 if i == 0 else 4)
             dst.blit(img, img.get_rect(center=(round(pos[0]), round(pos[1]))))
 
@@ -1617,8 +1902,28 @@ class TableScene(Scene):
             dst.blit(panel, panel.get_rect(center=(round(x), round(y))))
 
     def _draw_bet_and_button(self, dst: pygame.Surface, p, in_hand: bool) -> None:
+        display_stack = self._display_stack(p.seat, p.stack)
+        if in_hand and display_stack > 0:
+            draw_chip_pile(
+                dst,
+                self._stack_chip_pos(p.seat),
+                display_stack,
+                seed=p.seat * 19 + 5,
+                show_amount=False,
+                scale=0.58 if self.player_count >= 8 else 0.68,
+                min_chips=4,
+                max_chips=14,
+            )
         if in_hand and p.bet > 0:
-            draw_chip_pile(dst, self._bet_pos(p.seat), p.bet, seed=p.seat * 7 + 1)
+            draw_chip_pile(
+                dst,
+                self._bet_pos(p.seat),
+                p.bet,
+                seed=p.seat * 7 + 1,
+                scale=0.78,
+                min_chips=2,
+                max_chips=12,
+            )
         if in_hand and self.snap is not None and p.seat == self.snap.button_seat:
             bx, by = self._bet_pos(p.seat)
             ux, uy = _unit_to_center(self._seat_anchors[p.seat])
@@ -1702,13 +2007,33 @@ class TableScene(Scene):
                     theme.AMBER_LIGHT,
                     "topright",
                 )
+        # 独立保留上一手结算，不再让它被后续动作迅速顶出日志。
+        result_box = pygame.Rect(x - 5, 84, 344, 100)
+        pygame.draw.rect(dst, (27, 19, 13), result_box, border_radius=8)
+        pygame.draw.rect(dst, theme.AMBER_DARK, result_box, 1, border_radius=8)
+        theme.text(dst, "上一手结果", (x + 5, 91), 14, theme.AMBER_LIGHT)
+        result_lines = list(self._last_settlement_lines[:4])
+        if len(self._last_settlement_lines) > 4:
+            result_lines[-1] = f"…另有 {len(self._last_settlement_lines) - 3} 项逐池明细"
+        if not result_lines:
+            result_lines = ["尚无已结算牌局"]
+        for row, line in enumerate(result_lines):
+            compact = line if len(line) <= 29 else line[:28] + "…"
+            theme.text(
+                dst,
+                compact,
+                (x + 5, 112 + row * 18),
+                12,
+                theme.GOLD if row == 0 and self._last_settlement_lines else theme.TEXT_DIM,
+            )
+
         # 行动日志
-        theme.text(dst, "行动记录", (x, 96), 17, theme.TEXT_DIM)
+        theme.text(dst, "行动记录", (x, 193), 17, theme.TEXT_DIM)
         strategy_text, strategy_color = self._ai_strategy_status()
         theme.text(
             dst,
             strategy_text,
-            (PANEL_X + 358, 99),
+            (PANEL_X + 358, 196),
             12,
             strategy_color,
             "topright",
@@ -1716,9 +2041,9 @@ class TableScene(Scene):
         crowded = self.player_count >= 8
         self.log.draw(
             dst,
-            (x, 118, 340, 205 if crowded else 300),
-            max_lines=6 if crowded else 9,
-            size=15 if crowded else 16,
+            (x, 215, 340, 108 if crowded else 205),
+            max_lines=4 if crowded else 7,
+            size=14 if crowded else 15,
         )
         # 玩家速览
         players_title_y = 326 if crowded else 436
@@ -1745,7 +2070,8 @@ class TableScene(Scene):
                 name = p.name if len(p.name) <= 15 else p.name[:14] + "…"
                 row_size = 14 if crowded else 16
                 theme.text(dst, name, (x, y), row_size, col)
-                theme.text(dst, f"¢{p.stack}", (x + 150, y), row_size, theme.GOLD if col is theme.TEXT else col)
+                display_stack = self._display_stack(p.seat, p.stack)
+                theme.text(dst, f"¢{display_stack}", (x + 150, y), row_size, theme.GOLD if col is theme.TEXT else col)
                 if mark:
                     theme.text(dst, mark, (x + 232, y), 13 if crowded else 15, col)
                 y += 28 if crowded else 30
@@ -1867,8 +2193,8 @@ class TableScene(Scene):
         title, sub = self.banner
         # 横幅延迟淡入
         a = min(255, int(255 * self._phase_t / 0.35)) if self._phase_t < 1 else 255
-        panel = pygame.Rect(0, 0, 560, 150)
-        panel.center = (TABLE_C[0], 330)
+        panel = pygame.Rect(0, 0, 500, 112)
+        panel.center = (TABLE_C[0], 285)
         s = pygame.Surface(panel.size, pygame.SRCALPHA)
         pygame.draw.rect(s, (*theme.BG_PANEL, min(230, a)), s.get_rect(), border_radius=14)
         pygame.draw.rect(s, (*theme.AMBER, a), s.get_rect(), 2, border_radius=14)
@@ -1877,6 +2203,15 @@ class TableScene(Scene):
         theme.text(dst, sub, (panel.centerx, panel.centery + 42), 17, theme.TEXT_DIM, "center")
         if self._bust_dialog is not None:
             pass  # 出局处置框接管(绘制于横幅之上)
+        elif self._bust_queue:
+            theme.text(
+                dst,
+                "筹码推送完成后处理归零座位…",
+                (TABLE_C[0], 570),
+                17,
+                theme.TEXT_DIM,
+                "center",
+            )
         elif self.table.game_over and self._pending_joins:
             self.btn_next.label = "召回并继续"
             self.btn_next.draw(dst)

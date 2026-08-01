@@ -13,6 +13,70 @@ import pygame
 
 from . import theme
 
+# 酒馆筹码面值与颜色。金额始终由引擎保存为整数；视觉拆分仅决定
+# 桌上的筹码组合，不参与任何下注或结算计算。
+CHIP_DENOMINATIONS = (5000, 1000, 500, 100, 25, 5, 1)
+_CHIP_COLORS = {
+    5000: (206, 157, 54),   # 金
+    1000: (108, 82, 146),   # 紫
+    500: (166, 66, 61),     # 绛红
+    100: (48, 48, 52),      # 黑
+    25: (48, 126, 82),      # 绿
+    5: (183, 58, 50),       # 红
+    1: (214, 205, 184),     # 象牙白
+}
+
+
+def chip_color(denomination: int) -> tuple[int, int, int]:
+    """返回一个标准面值的筹码颜色。"""
+    return _CHIP_COLORS.get(denomination, theme.AMBER)
+
+
+def chip_breakdown(
+    amount: int,
+    *,
+    min_chips: int = 1,
+    max_chips: int = 18,
+) -> tuple[int, ...]:
+    """把金额确定性拆成有面值的视觉筹码。
+
+    先用标准面值贪心拆分，再在不超过视觉上限时把大额筹码换成下一档，
+    让 1000、5000 等整额也能形成可辨识的小堆。返回值之和始终等于
+    ``amount``；``0`` 返回空元组。
+    """
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise ValueError("筹码金额须为非负整数")
+    if amount == 0:
+        return ()
+    if min_chips < 1 or max_chips < min_chips:
+        raise ValueError("筹码数量边界非法")
+
+    remaining = amount
+    chips: list[int] = []
+    for denomination in CHIP_DENOMINATIONS:
+        count, remaining = divmod(remaining, denomination)
+        chips.extend([denomination] * count)
+    assert remaining == 0
+
+    while len(chips) < min_chips:
+        expanded = False
+        for index, denomination in enumerate(CHIP_DENOMINATIONS[:-1]):
+            if denomination not in chips:
+                continue
+            lower = CHIP_DENOMINATIONS[index + 1]
+            if denomination % lower:
+                continue
+            replacement_count = denomination // lower
+            if len(chips) - 1 + replacement_count > max_chips:
+                continue
+            chips.remove(denomination)
+            chips.extend([lower] * replacement_count)
+            expanded = True
+            break
+        if not expanded:
+            break
+    return tuple(sorted(chips, reverse=True))
+
 # ------------------------------------------------------------ 缓动
 
 
@@ -490,24 +554,40 @@ class _Chip:
     dst: tuple[float, float]
     delay: float
     duration: float
+    denomination: int = 25
+    group: str = "generic"
     t: float = 0.0
 
 
 class ChipFly:
-    """结算时筹码从底池飞向胜者座位的小动画。"""
+    """下注、收池与派彩共用的有面值筹码飞行动画。"""
 
     def __init__(self) -> None:
         self.chips: list[_Chip] = []
-        self._sprite: pygame.Surface | None = None
+        self._sprites: dict[int, pygame.Surface] = {}
 
-    def sprite(self) -> pygame.Surface:
-        if self._sprite is None:
+    def sprite(self, denomination: int = 25) -> pygame.Surface:
+        if denomination not in self._sprites:
             s = pygame.Surface((26, 26), pygame.SRCALPHA)
-            pygame.draw.circle(s, theme.AMBER, (13, 13), 12)
+            color = chip_color(denomination)
+            pygame.draw.circle(s, color, (13, 13), 12)
             pygame.draw.circle(s, theme.AMBER_LIGHT, (13, 13), 12, 2)
             pygame.draw.circle(s, theme.BG_PANEL, (13, 13), 6)
-            self._sprite = s
-        return self._sprite
+            # 四个浅色刻度让飞行中的筹码仍像实体筹码，而非纯色圆点。
+            for angle in (0, math.pi / 2, math.pi, math.pi * 1.5):
+                x1 = 13 + math.cos(angle) * 8
+                y1 = 13 + math.sin(angle) * 8
+                x2 = 13 + math.cos(angle) * 11
+                y2 = 13 + math.sin(angle) * 11
+                pygame.draw.line(
+                    s,
+                    theme.TEXT,
+                    (round(x1), round(y1)),
+                    (round(x2), round(y2)),
+                    2,
+                )
+            self._sprites[denomination] = s
+        return self._sprites[denomination]
 
     def launch(
         self,
@@ -515,22 +595,96 @@ class ChipFly:
         dst: tuple[float, float],
         count: int = 7,
         rng: random.Random | None = None,
+        *,
+        delay: float = 0.0,
+        group: str = "generic",
+    ) -> None:
+        """兼容旧调用：使用 25 面值的装饰筹码。"""
+        self._launch_tokens(
+            src,
+            dst,
+            (25,) * count,
+            rng=rng,
+            delay=delay,
+            group=group,
+        )
+
+    def launch_amount(
+        self,
+        src: tuple[float, float],
+        dst: tuple[float, float],
+        amount: int,
+        rng: random.Random | None = None,
+        *,
+        delay: float = 0.0,
+        group: str = "generic",
+        min_chips: int = 2,
+        max_chips: int = 18,
+    ) -> None:
+        """按真实金额拆分筹码并启动一批飞行动画。"""
+        tokens = chip_breakdown(
+            amount,
+            min_chips=min_chips,
+            max_chips=max_chips,
+        )
+        self._launch_tokens(
+            src,
+            dst,
+            tokens,
+            rng=rng,
+            delay=delay,
+            group=group,
+        )
+
+    def _launch_tokens(
+        self,
+        src: tuple[float, float],
+        dst: tuple[float, float],
+        tokens: tuple[int, ...],
+        *,
+        rng: random.Random | None,
+        delay: float,
+        group: str,
     ) -> None:
         rng = rng or random.Random(0)
-        for i in range(count):
+        for i, denomination in enumerate(tokens):
             jitter = (rng.uniform(-14, 14), rng.uniform(-10, 10))
             self.chips.append(
                 _Chip(
                     (src[0] + jitter[0], src[1] + jitter[1]),
                     (dst[0] + jitter[0], dst[1] + jitter[1]),
-                    delay=i * 0.05,
+                    delay=delay + i * 0.04,
                     duration=0.45,
+                    denomination=denomination,
+                    group=group,
                 )
             )
 
     @property
     def busy(self) -> bool:
         return bool(self.chips)
+
+    def busy_for(self, group: str) -> bool:
+        """某一批次是否仍有筹码在飞行。"""
+        return any(chip.group == group for chip in self.chips)
+
+    def started_for(self, group: str) -> bool:
+        """某批筹码是否已经越过等待时间、真正开始移动。"""
+        return any(
+            chip.group == group and chip.t >= chip.delay
+            for chip in self.chips
+        )
+
+    @property
+    def remaining(self) -> float:
+        """所有已排队筹码动画距离完成的最长剩余秒数。"""
+        return max(
+            (chip.delay + chip.duration - chip.t for chip in self.chips),
+            default=0.0,
+        )
+
+    def clear(self) -> None:
+        self.chips.clear()
 
     def update(self, dt: float) -> None:
         done = []
@@ -542,11 +696,11 @@ class ChipFly:
             self.chips.remove(c)
 
     def draw(self, dst: pygame.Surface) -> None:
-        s = self.sprite()
         for c in self.chips:
             t = c.t - c.delay
             if t < 0:
                 continue
+            s = self.sprite(c.denomination)
             frac = Ease.out_back(min(1.0, t / c.duration))
             pos = lerp_pos(c.src, c.dst, frac)
             # 抛物线弧度

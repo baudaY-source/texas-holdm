@@ -6,8 +6,8 @@
 同时验收弃牌名牌、muck 动画与当前行动反馈)、
 (o) 六人桌弃到两人的翻后 NFSP 实验 HU 池来源提示、
 (f) 翻前图表查看器、(g-i) 训练场(编辑器/快速分析/求解矩阵)、
-(j-k) 训练 drills、(l-m) 回顾/统计、(n) 出局处置框(买入/移出)、
-(p) 九人 straddle 桌、(q) 空位召回配置。
+(j-k) 训练 drills、(l-m) 回顾/统计、(n0) 全下摊牌结果(爆仓处置前)、
+(n) 出局处置框(买入/移出)、(p) 九人 straddle 桌、(q) 空位召回配置。
 全程种子固定,可复现。
 
 用法: ``.venv/Scripts/python.exe tools/shots.py out_shots/``
@@ -31,7 +31,7 @@ import pygame  # noqa: E402
 from engine.state import Action, ActionType  # noqa: E402
 from ui.scenes.game_setup import GameSetupScene  # noqa: E402
 from ui.scenes.menu import MenuScene  # noqa: E402
-from ui.scenes.table import TableScene  # noqa: E402
+from ui.scenes.table import BUST_RESULT_SECONDS, TableScene  # noqa: E402
 
 SIZE = (1600, 900)
 SEED = 42
@@ -423,9 +423,9 @@ def shot_stats(path: Path) -> None:
     _render(scene, path)
 
 
-def shot_bust_rebuy(path: Path) -> None:
-    """M8 (n):狐狸 Foxy 全下出局,弹买入/移出处置框。"""
-    scene = TableScene(
+def _bust_scene() -> TableScene:
+    """复用狐狸全下出局夹具，供结算与处置框两张截图使用。"""
+    return TableScene(
         seed=SEED,
         headless=True,
         auto_human=True,
@@ -433,6 +433,30 @@ def shot_bust_rebuy(path: Path) -> None:
         hole_script=dict(HOLE_N),
         board_script=list(BOARD_N),
     )
+
+
+def shot_bust_showdown_result(path: Path) -> None:
+    """M8 (n0):亮牌与结果已展示，但尚未弹出爆仓处置框。"""
+    scene = _bust_scene()
+    ok = _step_until(
+        scene,
+        lambda: scene.phase == "finish" and scene._bust_dialog is None,
+        40.0,
+    )
+    assert ok, "未能等到爆仓前的摊牌结算画面"
+    freeze_seconds = min(0.55, BUST_RESULT_SECONDS - 0.1)
+    assert freeze_seconds > 0, "爆仓结果停留时间必须为正"
+    _step(scene, freeze_seconds)
+    assert scene.phase == "finish" and scene.banner is not None
+    assert scene.reveal and scene.chipfly.busy
+    assert scene._bust_dialog is None
+    assert scene._phase_t < BUST_RESULT_SECONDS
+    _render(scene, path)
+
+
+def shot_bust_rebuy(path: Path) -> None:
+    """M8 (n):狐狸 Foxy 全下出局,弹买入/移出处置框。"""
+    scene = _bust_scene()
     ok = _step_until(scene, lambda: scene._bust_dialog is not None, 40.0)
     assert ok, "未能等到出局处置框"
     _step_until(scene, lambda: not scene.chipfly.busy, 5.0)
@@ -455,14 +479,7 @@ def shot_nine_seat_straddle(path: Path) -> None:
 
 def shot_empty_seat_join(path: Path) -> None:
     """狐狸被移出后点击空位，展示身份/打法/买入和好友预留入口。"""
-    scene = TableScene(
-        seed=SEED,
-        headless=True,
-        auto_human=True,
-        action_script={k: list(v) for k, v in SCRIPT_N.items()},
-        hole_script=dict(HOLE_N),
-        board_script=list(BOARD_N),
-    )
+    scene = _bust_scene()
     ok = _step_until(scene, lambda: scene._bust_dialog is not None, 40.0)
     assert ok and scene._bust_dialog is not None, "未能等到出局处置框"
     scene._resolve_bust_alt(scene._bust_dialog)
@@ -483,7 +500,7 @@ def shot_empty_seat_join(path: Path) -> None:
 
 
 def render_all(out_dir: str | os.PathLike) -> list[Path]:
-    """渲染全部十八张截图,返回路径列表。"""
+    """渲染全部十九张截图,返回路径列表。"""
     _init()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -503,6 +520,7 @@ def render_all(out_dir: str | os.PathLike) -> list[Path]:
         ("k_drills_feedback.png", shot_drills_feedback),
         ("l_review.png", shot_review),
         ("m_stats.png", shot_stats),
+        ("n0_bust_showdown_result.png", shot_bust_showdown_result),
         ("n_bust_rebuy.png", shot_bust_rebuy),
         ("p_nine_seat_straddle.png", shot_nine_seat_straddle),
         ("q_empty_seat_join.png", shot_empty_seat_join),

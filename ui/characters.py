@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import pygame
 
-from . import theme
+from . import fx, theme
 from .respath import res_path
 
 # 半身像画布尺寸
@@ -535,18 +535,58 @@ def draw_chip_pile(
     center: tuple[float, float],
     amount: int,
     seed: int = 0,
+    *,
+    show_amount: bool = True,
+    scale: float = 1.0,
+    min_chips: int = 2,
+    max_chips: int = 18,
 ) -> None:
-    """当前下注筹码堆:几枚错落筹码 + 金额。"""
+    """按真实面值组合绘制筹码堆，并可附精确金额。"""
+    if amount <= 0:
+        return
     rng = random.Random(seed)
-    n = min(6, 1 + amount // 40)
-    for i in range(n):
-        cx = center[0] + rng.uniform(-18, 18)
-        cy = center[1] + rng.uniform(-6, 6) - i * 3
-        col = theme.AMBER if i % 2 == 0 else theme.TEAL
-        rect = pygame.Rect(0, 0, 34, 15)
-        rect.center = (round(cx), round(cy))
-        pygame.draw.ellipse(dst, col, rect)
-        pygame.draw.ellipse(dst, theme.AMBER_LIGHT if i % 2 == 0 else theme.TEAL, rect, 2)
-        pygame.draw.ellipse(dst, theme.BG_PANEL, rect.inflate(-14, -6), 1)
-    theme.text(dst, str(amount), (center[0], center[1] - 24), 17,
-               theme.GOLD, "midbottom", shadow=True)
+    tokens = fx.chip_breakdown(
+        amount,
+        min_chips=min_chips,
+        max_chips=max_chips,
+    )
+    grouped: list[tuple[int, int]] = []
+    for denomination in fx.CHIP_DENOMINATIONS:
+        count = tokens.count(denomination)
+        if count:
+            grouped.append((denomination, count))
+
+    width = max(16, round(30 * scale))
+    height = max(7, round(12 * scale))
+    spacing = max(13, round(19 * scale))
+    lift = max(2, round(3 * scale))
+    columns = len(grouped)
+    top = center[1]
+    for column, (denomination, count) in enumerate(grouped):
+        cx = center[0] + (column - (columns - 1) / 2) * spacing
+        # 每一列只做极轻微的固定错位，堆形稳定且不显得机械。
+        cx += rng.uniform(-1.5, 1.5) * scale
+        color = fx.chip_color(denomination)
+        for row in range(count):
+            cy = center[1] - row * lift + rng.uniform(-0.45, 0.45) * scale
+            top = min(top, cy - height / 2)
+            rect = pygame.Rect(0, 0, width, height)
+            rect.center = (round(cx), round(cy))
+            pygame.draw.ellipse(dst, color, rect)
+            pygame.draw.ellipse(dst, theme.AMBER_LIGHT, rect, max(1, round(scale)))
+            pygame.draw.ellipse(
+                dst,
+                theme.BG_PANEL,
+                rect.inflate(-max(6, round(12 * scale)), -max(3, round(5 * scale))),
+                1,
+            )
+    if show_amount:
+        theme.text(
+            dst,
+            str(amount),
+            (center[0], top - 5),
+            max(12, round(16 * scale)),
+            theme.GOLD,
+            "midbottom",
+            shadow=True,
+        )

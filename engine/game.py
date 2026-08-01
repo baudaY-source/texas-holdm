@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from pokerkit import Automation, NoLimitTexasHoldem
+from phevaluator import evaluate_cards
 from pokerkit.state import State
 
 from .history import HandHistoryWriter
@@ -141,15 +142,30 @@ class TableConfig:
 
 
 @dataclass(frozen=True)
+class PotAward:
+    """一个主池/边池的真实派彩明细。
+
+    :param pot_index: ``0`` 为主池，其后依次为边池。
+    :param pot: 对应底池的金额与有资格争夺的座位。
+    :param payouts: ``(座位, 金额)``；平分与奇数筹码均保留实际结果。
+    """
+
+    pot_index: int
+    pot: PotInfo
+    payouts: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class HandResult:
     """一手牌结算结果。"""
 
     hand_id: int
     deltas: dict[int, int]  # 座位 -> 本手净盈亏
-    winners: dict[int, int]  # 座位 -> 赢得金额(delta > 0)
+    winners: dict[int, int]  # 座位 -> 从全部底池获得的毛派彩
     showdown: bool
     board: tuple[str, ...]
     pots: tuple[PotInfo, ...]
+    pot_awards: tuple[PotAward, ...]
 
 
 class Table:
@@ -752,12 +768,12 @@ class Table:
         self._showdown = len(self._active) - len(folded_seats) >= 2
         invested = _trim_uncalled(self._invested)
         pots = tuple(_build_pots(invested, folded_seats))
-        winners = {
-            seat: deltas[seat] + invested[seat]
-            for seat in self._active
-            if deltas[seat] + invested[seat] > 0
-        }
         board = tuple(_card_str(c) for c in st.get_board_cards(0))
+        pot_awards = self._extract_pot_awards(pots, board, self._showdown)
+        winners: dict[int, int] = {}
+        for award in pot_awards:
+            for seat, amount in award.payouts:
+                winners[seat] = winners.get(seat, 0) + amount
         self._last_result = HandResult(
             hand_id=self._hand_id,
             deltas=deltas,
@@ -765,12 +781,63 @@ class Table:
             showdown=self._showdown,
             board=board,
             pots=pots,
+            pot_awards=pot_awards,
         )
         if self._writer is not None:
-            self._writer.write_hand(self._history_record(board, pots, winners))
+            self._writer.write_hand(
+                self._history_record(
+                    board,
+                    pots,
+                    pot_awards,
+                    winners,
+                    self._showdown,
+                )
+            )
+
+    def _extract_pot_awards(
+        self,
+        pots: tuple[PotInfo, ...],
+        board: tuple[str, ...],
+        showdown: bool,
+    ) -> tuple[PotAward, ...]:
+        """按每个重建底池的资格与牌力计算真实派彩。
+
+        PokerKit 会在 kill/push 阶段合并同一赢家可获得的相邻底池，
+        因而其 ``pot_index`` 不能稳定映射回本项目保留的主池/边池结构。
+        这里逐池比较牌力；平分余筹按 PokerKit 座位顺序发放，既保留
+        可解释的逐池明细，也与引擎最终筹码一致。
+        """
+        awards: list[PotAward] = []
+        for index, pot in enumerate(pots):
+            eligible = tuple(pot.eligible_seats)
+            if not eligible:
+                raise RuntimeError(f"底池 {index} 没有可获奖座位")
+            if showdown and len(eligible) > 1:
+                ranks = {
+                    seat: evaluate_cards(*self._hole[seat], *board)
+                    for seat in eligible
+                }
+                best = min(ranks.values())
+                winning_seats = [seat for seat in eligible if ranks[seat] == best]
+            else:
+                # 未摊牌时 PotInfo 已排除弃牌者；正常情况下只剩一名。
+                winning_seats = list(eligible)
+            ordered = sorted(winning_seats, key=self._seat_to_pk.__getitem__)
+            share, odd = divmod(pot.amount, len(ordered))
+            payout_by_seat = {seat: share for seat in ordered}
+            for seat in ordered[:odd]:
+                payout_by_seat[seat] += 1
+            payouts = tuple(sorted(payout_by_seat.items()))
+            awards.append(PotAward(index, pot, payouts))
+        return tuple(awards)
 
     def _history_record(
-        self, board: tuple[str, ...], pots: tuple[PotInfo, ...], winners: dict[int, int]
+        self,
+        board: tuple[str, ...],
+        pots: tuple[PotInfo, ...],
+        pot_awards: tuple[PotAward, ...],
+        winners: dict[int, int],
+        showdown: bool,
     ) -> dict[str, Any]:
         """组装一手牌的历史记录(纯数据)。"""
         return {
@@ -796,8 +863,21 @@ class Table:
             "button_seat": self._button_seat,
             "actions": list(self._action_log),
             "board": list(board),
+            "showdown": showdown,
             "pots": [
                 {"amount": p.amount, "eligible_seats": list(p.eligible_seats)} for p in pots
+            ],
+            "pot_awards": [
+                {
+                    "pot_index": award.pot_index,
+                    "amount": award.pot.amount,
+                    "eligible_seats": list(award.pot.eligible_seats),
+                    "payouts": [
+                        {"seat": seat, "amount": amount}
+                        for seat, amount in award.payouts
+                    ],
+                }
+                for award in pot_awards
             ],
             "winners": [{"seat": s, "amount": a} for s, a in sorted(winners.items())],
             "end_stacks": {str(s): self._stacks[s] for s in self._active},
