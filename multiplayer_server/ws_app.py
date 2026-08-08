@@ -2,7 +2,8 @@
 
 牌局规则、认证座位及房间状态全部由注入的 ``TransportBackend`` 掌管。
 本模块仅负责 HTTP 健康检查、WebSocket 生命周期、hello 门禁、消息大小、
-保活和异常到稳定 wire error / close code 的映射。
+保活和异常到稳定 wire error / close code 的映射。可选的精确私密路径
+只用于短时 Tunnel 联调的第一道门，不替代房间 resume token 或长期认证。
 """
 from __future__ import annotations
 
@@ -34,6 +35,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 HEALTH_PATH = "/health"
 WS_PATH = "/ws"
+MAX_WS_PATH_CHARS = 256
+MIN_PATH_TOKEN_CHARS = 32
 
 DEFAULT_HELLO_TIMEOUT = 5.0
 DEFAULT_OUTBOUND_QUEUE = 64
@@ -51,6 +54,7 @@ _ROOM_CHARS = frozenset(
 _TOKEN_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+_WS_PATH_CHARS = _TOKEN_CHARS | frozenset("/.")
 _CLOSE_REASON_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
 )
@@ -118,9 +122,13 @@ class ConnectionRejected(RuntimeError):
 
 @dataclass(frozen=True)
 class TransportConfig:
-    """服务端传输参数；网络接口固定为 IPv4 localhost。"""
+    """服务端传输参数；网络接口固定为 IPv4 localhost。
+
+    ``ws_path`` 可能携带临时高熵 token，因此默认不进入 repr。
+    """
 
     port: int = DEFAULT_PORT
+    ws_path: str = field(default=WS_PATH, repr=False)
     hello_timeout: float = DEFAULT_HELLO_TIMEOUT
     outbound_queue: int = DEFAULT_OUTBOUND_QUEUE
     ping_interval: float = DEFAULT_PING_INTERVAL
@@ -132,6 +140,7 @@ class TransportConfig:
             raise ValueError("port 必须是整数")
         if not 0 <= self.port <= 65535:
             raise ValueError("port 必须在 0-65535 之间")
+        _validate_ws_path(self.ws_path)
         if not _positive_number(self.hello_timeout):
             raise ValueError("hello_timeout 必须为正数")
         if (
@@ -270,14 +279,16 @@ def make_error_message(code: str, message: str) -> dict[str, object]:
 def process_http_request(
     connection: ServerConnection,
     request: Request,
+    *,
+    ws_path: str = WS_PATH,
 ) -> Response | None:
-    """在同一端口只提供 ``GET /health`` 与精确 ``/ws`` Upgrade。"""
+    """在同一端口只提供 ``GET /health`` 与精确 WS Upgrade路径。"""
     path = request.path
     if path == HEALTH_PATH:
         response = connection.respond(HTTPStatus.OK, "OK\n")
         response.headers["Cache-Control"] = "no-store"
         return response
-    if path != WS_PATH:
+    if path != ws_path:
         response = connection.respond(HTTPStatus.NOT_FOUND, "Not Found\n")
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -296,7 +307,7 @@ async def create_server(
         handler,
         DEFAULT_HOST,
         active.port,
-        process_request=process_http_request,
+        process_request=partial(process_http_request, ws_path=active.ws_path),
         compression=None,
         server_header=None,
         open_timeout=10,
@@ -632,6 +643,34 @@ def _positive_number(value: object) -> bool:
     )
 
 
+def ws_path_from_token(token: str) -> str:
+    """将高熵 URL-safe token 映射为精确私密 WS 路径。
+
+    这只是临时 Tunnel 的不可猜路径，不是用户或房间身份凭据。
+    """
+    if (
+        not isinstance(token, str)
+        or not MIN_PATH_TOKEN_CHARS <= len(token) <= 128
+        or any(ch not in _TOKEN_CHARS for ch in token)
+    ):
+        raise ValueError(
+            f"path token 必须是 {MIN_PATH_TOKEN_CHARS}-128 位 URL-safe 字符"
+        )
+    return f"{WS_PATH}/{token}"
+
+
+def _validate_ws_path(path: object) -> None:
+    """校验自定义路径，禁止 query/fragment/编码别名带来匹配歧义。"""
+    if (
+        not isinstance(path, str)
+        or not 2 <= len(path) <= MAX_WS_PATH_CHARS
+        or not path.startswith("/")
+        or path == HEALTH_PATH
+        or any(ch not in _WS_PATH_CHARS for ch in path)
+    ):
+        raise ValueError("ws_path 必须是 2-256 位、以 / 开头的精确 ASCII 路径")
+
+
 def _valid_application_close(value: object) -> bool:
     """后端只使用 RFC 私有范围，避免伪造保留的标准关闭码。"""
     return (
@@ -645,6 +684,8 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "HEALTH_PATH",
+    "MAX_WS_PATH_CHARS",
+    "MIN_PATH_TOKEN_CHARS",
     "WS_PATH",
     "Close",
     "ConnectionRejected",
@@ -655,4 +696,5 @@ __all__ = [
     "create_server",
     "make_error_message",
     "process_http_request",
+    "ws_path_from_token",
 ]

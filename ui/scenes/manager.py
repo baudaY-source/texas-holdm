@@ -13,6 +13,9 @@ class Scene:
     def on_enter(self) -> None:
         """进入场景(被压入/换回时)调用。"""
 
+    def on_exit(self) -> None:
+        """场景被替换、弹出或程序退出时调用；可释放网络等外部资源。"""
+
     def handle_event(self, ev: pygame.event.Event) -> None:
         pass
 
@@ -52,7 +55,7 @@ class SceneManager:
 
     def _swap(self, scene: Scene) -> None:
         if self.stack:
-            self.stack.pop()
+            self.stack.pop().on_exit()
         self.push(scene)
 
     def push(self, scene: Scene) -> None:
@@ -62,7 +65,7 @@ class SceneManager:
 
     def pop(self) -> None:
         if self.stack:
-            self.stack.pop()
+            self.stack.pop().on_exit()
         if self.stack:
             self.stack[-1].on_enter()
 
@@ -114,24 +117,28 @@ class SceneManager:
         screen = pygame.display.set_mode(self.size, pygame.RESIZABLE)
         canvas = pygame.Surface(self.size)
         clock = pygame.time.Clock()
-        while not self.quit_requested:
-            dt = clock.tick(60) / 1000.0
-            for ev in pygame.event.get():
-                if ev.type == pygame.QUIT:
-                    self.quit()
-                elif ev.type == pygame.VIDEORESIZE:
-                    screen = pygame.display.set_mode(
-                        (max(960, ev.w), max(600, ev.h)), pygame.RESIZABLE
-                    )
+        try:
+            while not self.quit_requested:
+                dt = clock.tick(60) / 1000.0
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        self.quit()
+                    elif ev.type == pygame.VIDEORESIZE:
+                        screen = pygame.display.set_mode(
+                            (max(960, ev.w), max(600, ev.h)), pygame.RESIZABLE
+                        )
+                    else:
+                        self.handle_event(ev)
+                self.update(dt)
+                canvas.fill((0, 0, 0))
+                self.draw(canvas)
+                if screen.get_size() != canvas.get_size():
+                    pygame.transform.smoothscale(canvas, screen.get_size(), screen)
                 else:
-                    self.handle_event(ev)
-            self.update(dt)
-            canvas.fill((0, 0, 0))
-            self.draw(canvas)
-            if screen.get_size() != canvas.get_size():
-                pygame.transform.smoothscale(canvas, screen.get_size(), screen)
-            else:
-                screen.blit(canvas, (0, 0))
-            pygame.display.flip()
-        pygame.quit()
+                    screen.blit(canvas, (0, 0))
+                pygame.display.flip()
+        finally:
+            while self.stack:
+                self.stack.pop().on_exit()
+            pygame.quit()
         return 0

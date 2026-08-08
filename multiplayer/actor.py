@@ -2,8 +2,8 @@
 
 ``RoomActor`` 是权威 ``RoomCore`` 与未来 WebSocket 传输层之间的并发
 边界。所有会读取或修改房间核心的操作都经过同一个 ``asyncio.Queue``，
-因此 ``RoomCore`` 本身无需持锁。传输层只持有不透明 token，座位必须由
-核心解析，不能从客户端连接参数注入。
+因此 ``RoomCore`` 本身无需持锁。传输层只持有不透明 token；连接绑定的
+是稳定成员而非座位，未入座与换座不会导致连接失效。
 
 本模块不依赖 pygame 或任何 WebSocket 实现。
 """
@@ -19,9 +19,9 @@ from typing import Protocol, TypeAlias, TypeVar
 from .protocol import ClientEnvelope
 
 ServerMessage: TypeAlias = Mapping[str, object]
-SeatProjector: TypeAlias = Callable[[int], ServerMessage]
+TokenProjector: TypeAlias = Callable[[str], ServerMessage]
+AutomaticStepper: TypeAlias = Callable[[], bool | Awaitable[bool]]
 _T = TypeVar("_T")
-
 
 class RoomCoreLike(Protocol):
     """Actor 所需的最小房间核心接口。"""
@@ -33,8 +33,8 @@ class RoomCoreLike(Protocol):
     ) -> object | Awaitable[object]:
         """处理一条已解析意图并返回私有响应。"""
 
-    def seat_for_token(self, token: str) -> int | Awaitable[int]:
-        """认证 token，并返回它绑定的座位。"""
+    def principal_for_token(self, token: str) -> str | Awaitable[str]:
+        """认证 token，并返回不含秘密的稳定成员 ID。"""
 
 
 class ActorStateError(RuntimeError):
@@ -50,7 +50,7 @@ class ActorClosedError(ActorStateError):
 
 
 class ActorAuthenticationError(ValueError):
-    """核心没有把 token 解析为合法座位。"""
+    """核心没有把 token 解析为合法稳定成员。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +62,10 @@ class OutboundChannel:
     """
 
     connection_id: str
-    seat: int
+    principal_id: str
     queue: asyncio.Queue[dict[str, object]]
     disconnected: asyncio.Event = field(default_factory=asyncio.Event)
+    _token: str = field(repr=False, default="")
     _disconnect_reason: str | None = field(default=None, init=False, repr=False)
 
     @property
@@ -96,6 +97,18 @@ class PublishReport:
         return len(self.delivered)
 
 
+@dataclass(frozen=True, slots=True)
+class AutomaticStepReport:
+    """一次服务端自动转换的结果。
+
+    计时器应在 actor 外等待；到期后只把单步转换投入 mailbox。这样 AI
+    思考间隔或结算停留不会阻塞真人命令、重连与断线。
+    """
+
+    changed: bool
+    publication: PublishReport | None
+
+
 @dataclass(slots=True)
 class _SubmitCommand:
     token: str = field(repr=False)
@@ -107,7 +120,7 @@ class _SubmitCommand:
 class _SubmitAndPublishCommand:
     token: str = field(repr=False)
     envelope: ClientEnvelope
-    projector: SeatProjector
+    projector: TokenProjector
     reply: asyncio.Future[tuple[object, PublishReport]]
 
 
@@ -128,7 +141,7 @@ class _DisconnectCommand:
 
 @dataclass(slots=True)
 class _PublishCommand:
-    projector: SeatProjector
+    projector: TokenProjector
     reply: asyncio.Future[PublishReport]
 
 
@@ -138,6 +151,13 @@ class _BroadcastCommand:
     reply: asyncio.Future[PublishReport]
 
 
+@dataclass(slots=True)
+class _StepAutomaticCommand:
+    stepper: AutomaticStepper
+    projector: TokenProjector
+    reply: asyncio.Future[AutomaticStepReport]
+
+
 _MailboxCommand: TypeAlias = (
     _SubmitCommand
     | _SubmitAndPublishCommand
@@ -145,6 +165,7 @@ _MailboxCommand: TypeAlias = (
     | _DisconnectCommand
     | _PublishCommand
     | _BroadcastCommand
+    | _StepAutomaticCommand
 )
 _STOP = object()
 
@@ -172,7 +193,7 @@ class RoomActor:
         self._lifecycle = _Lifecycle.NEW
         self._worker: asyncio.Task[None] | None = None
         self._connections: dict[str, OutboundChannel] = {}
-        self._connection_for_seat: dict[int, str] = {}
+        self._connection_for_principal: dict[str, str] = {}
 
     @property
     def running(self) -> bool:
@@ -228,9 +249,9 @@ class RoomActor:
         self,
         token: str,
         envelope: ClientEnvelope,
-        projector: SeatProjector,
+        projector: TokenProjector,
     ) -> tuple[object, PublishReport]:
-        """原子处理意图并广播变更后的逐座位投影。
+        """原子处理意图并广播变更后的逐成员私有投影。
 
         ``handle`` 与 ``projector`` 在同一个 mailbox 命令中连续执行，其他
         submit 不可能插到二者之间，因此不会把下一次变更误标成上一次变更
@@ -253,10 +274,10 @@ class RoomActor:
         *,
         capacity: int | None = None,
     ) -> OutboundChannel:
-        """认证 token 并注册连接，不允许调用方直接提供座位。
+        """认证 token 并注册连接，不允许调用方直接提供座位或成员 ID。
 
-        同一座位的新连接会把旧连接标记为 ``replaced``，符合恢复 token
-        重连替换旧连接的约定。
+        同一稳定成员的新连接会把旧连接标记为 ``replaced``；成员未入座、
+        离座或换座均不改变该身份。
         """
         if not isinstance(connection_id, str) or not connection_id:
             raise ValueError("connection_id 不能为空")
@@ -289,8 +310,11 @@ class RoomActor:
         self._enqueue(_DisconnectCommand(connection_id, reason, reply))
         return await reply
 
-    async def publish_per_seat(self, projector: SeatProjector) -> PublishReport:
-        """在 actor 内为每个认证座位生成并投递独立安全投影。
+    async def publish_per_principal(
+        self,
+        projector: TokenProjector,
+    ) -> PublishReport:
+        """在 actor 内按各成员 token 生成并投递独立安全投影。
 
         投影先全部生成，任何 projector 异常都不会造成半次广播。投递使用
         ``put_nowait``；满队列会断开慢连接并继续服务其他座位。
@@ -307,6 +331,25 @@ class RoomActor:
             raise TypeError("message 必须是 Mapping")
         reply: asyncio.Future[PublishReport] = self._new_reply()
         self._enqueue(_BroadcastCommand(dict(message), reply))
+        return await reply
+
+    async def step_automatic(
+        self,
+        stepper: AutomaticStepper,
+        projector: TokenProjector,
+    ) -> AutomaticStepReport:
+        """原子执行至多一次自动转换，并在真实变更后广播。
+
+        本方法本身绝不等待展示延迟。调用方应先在 actor/lifecycle lock
+        之外完成计时，再调用本方法。``stepper`` 返回 ``False`` 时不会
+        生成重复状态广播。
+        """
+        if not callable(stepper):
+            raise TypeError("stepper 必须可调用")
+        if not callable(projector):
+            raise TypeError("projector 必须可调用")
+        reply: asyncio.Future[AutomaticStepReport] = self._new_reply()
+        self._enqueue(_StepAutomaticCommand(stepper, projector, reply))
         return await reply
 
     def connection(self, connection_id: str) -> OutboundChannel | None:
@@ -345,6 +388,7 @@ class RoomActor:
                             _DisconnectCommand,
                             _PublishCommand,
                             _BroadcastCommand,
+                            _StepAutomaticCommand,
                         ),
                     ):
                         raise RuntimeError("RoomActor mailbox 收到未知命令")
@@ -374,6 +418,18 @@ class RoomActor:
                 result = self._publish_projected(command.projector)
             elif isinstance(command, _BroadcastCommand):
                 result = self._deliver(lambda _channel: command.message)
+            elif isinstance(command, _StepAutomaticCommand):
+                changed = await _resolve(command.stepper())
+                if type(changed) is not bool:
+                    raise TypeError("stepper 必须返回 bool")
+                result = AutomaticStepReport(
+                    changed=changed,
+                    publication=(
+                        self._publish_projected(command.projector)
+                        if changed
+                        else None
+                    ),
+                )
             else:  # pragma: no cover - _MailboxCommand 已穷尽
                 raise RuntimeError("RoomActor 收到未知命令")
         except Exception as exc:
@@ -384,35 +440,40 @@ class RoomActor:
                 command.reply.set_result(result)
 
     async def _register(self, command: _RegisterCommand) -> OutboundChannel:
-        seat = await _resolve(self._core.seat_for_token(command.token))
-        if isinstance(seat, bool) or not isinstance(seat, int) or seat < 0:
-            raise ActorAuthenticationError("token 未绑定到合法座位")
+        principal_id = await _resolve(
+            self._core.principal_for_token(command.token)
+        )
+        if not isinstance(principal_id, str) or not principal_id:
+            raise ActorAuthenticationError("token 未绑定到合法稳定成员")
 
-        # connection_id 重用与同座位重连都先原子断开旧连接。
+        # connection_id 重用与同成员重连都先原子断开旧连接。
         self._disconnect_now(command.connection_id, "replaced")
-        previous_id = self._connection_for_seat.get(seat)
+        previous_id = self._connection_for_principal.get(principal_id)
         if previous_id is not None:
             self._disconnect_now(previous_id, "replaced")
 
         channel = OutboundChannel(
             connection_id=command.connection_id,
-            seat=seat,
+            principal_id=principal_id,
             queue=asyncio.Queue(maxsize=command.capacity),
+            _token=command.token,
         )
         self._connections[command.connection_id] = channel
-        self._connection_for_seat[seat] = command.connection_id
+        self._connection_for_principal[principal_id] = command.connection_id
         return channel
 
-    def _publish_projected(self, projector: SeatProjector) -> PublishReport:
-        projections: dict[int, dict[str, object]] = {}
+    def _publish_projected(self, projector: TokenProjector) -> PublishReport:
+        projections: dict[str, dict[str, object]] = {}
         for channel in self._connections.values():
-            if channel.seat in projections:
+            if channel.principal_id in projections:
                 continue
-            projected = projector(channel.seat)
+            projected = projector(channel._token)
             if not isinstance(projected, Mapping):
                 raise TypeError("projector 必须返回 Mapping")
-            projections[channel.seat] = dict(projected)
-        return self._deliver(lambda channel: projections[channel.seat])
+            projections[channel.principal_id] = dict(projected)
+        return self._deliver(
+            lambda channel: projections[channel.principal_id]
+        )
 
     def _deliver(
         self,
@@ -437,8 +498,11 @@ class RoomActor:
         channel = self._connections.pop(connection_id, None)
         if channel is None:
             return False
-        if self._connection_for_seat.get(channel.seat) == connection_id:
-            del self._connection_for_seat[channel.seat]
+        if (
+            self._connection_for_principal.get(channel.principal_id)
+            == connection_id
+        ):
+            del self._connection_for_principal[channel.principal_id]
         channel._mark_disconnected(reason)
         return True
 
@@ -459,10 +523,12 @@ __all__ = [
     "ActorClosedError",
     "ActorNotStartedError",
     "ActorStateError",
+    "AutomaticStepReport",
+    "AutomaticStepper",
     "OutboundChannel",
     "PublishReport",
     "RoomActor",
     "RoomCoreLike",
-    "SeatProjector",
+    "TokenProjector",
     "ServerMessage",
 ]

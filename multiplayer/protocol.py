@@ -1,7 +1,8 @@
-"""朋友联机协议 v1 的严格 JSON 边界。
+"""朋友联机协议 v2 的严格 JSON 边界。
 
-本模块只解析客户端意图，不信任客户端提供的座位、合法金额或牌局状态。
-传输层完成 token 认证后，权威房间再把已绑定座位注入引擎动作。
+本模块只解析客户端意图，不信任客户端提供的行动座位、合法金额或牌局
+状态。v2 token 认证的是成员；只有 ``target_seat`` 选择/管理命令可提出
+物理座位，真正的投注座位仍由权威房间从成员当前入座状态注入。
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 from uuid import UUID
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
 # 与 JSON/JavaScript/Android 常见客户端都能无损互通的整数上限。
 MAX_WIRE_INTEGER = 9_007_199_254_740_991
@@ -22,14 +23,29 @@ CLIENT_MESSAGE_TYPES = frozenset(
         "ping",
         "room.create",
         "room.join",
+        "room.ai.fill",
+        "room.ai.clear",
+        "room.ai.add",
+        "room.ai.remove",
+        "room.ai.rebuy",
+        "room.ai.style",
         "room.ready",
         "room.start",
         "room.leave",
+        "room.pause",
+        "room.resume",
         "game.action",
         "game.show",
         "game.next_hand",
+        "seat.claim",
+        "seat.release",
         "seat.rebuy",
         "seat.leave",
+        "seat.topup.request",
+        "seat.topup.cancel",
+        "seat.topup.decline",
+        "seat.topup.approve",
+        "seat.topup.reject",
     }
 )
 
@@ -56,7 +72,7 @@ class ProtocolError(ValueError):
 
 @dataclass(frozen=True)
 class ClientEnvelope:
-    """校验后的客户端消息；不含认证座位。"""
+    """校验后的客户端消息；不含认证成员或行动座位。"""
 
     version: int
     message_type: str

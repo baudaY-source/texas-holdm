@@ -1,8 +1,18 @@
-# 《酒馆德州》朋友联机协议 v1（Alpha）
+# 《酒馆德州》朋友联机协议 v1（历史归档）
+
+> **历史协议，不能连接当前 v2 服务。** 本文仅用于追溯旧版 Android v0.5.1
+> 与后端 Alpha 的 wire 契约；当前实现、客户端和新测试统一以
+> [`MULTIPLAYER_PROTOCOL_V2.md`](MULTIPLAYER_PROTOCOL_V2.md) 为准。
 
 状态：协议门禁、RoomCore、串行 actor、单房间注册表与 localhost WebSocket
-服务已经实现；Windows/Android 联机大厅、牌桌 UI、分阶段结算事件和公网 WSS
-入口尚未会合。当前可用两个协议客户端联调，但现有 EXE / APK 仍只提供单机。
+服务已经实现。Windows 源码端已有后台客户端、房主大厅和服务器权威牌桌；
+Android v0.5.1 已交付 2–9 真人建房、个人视角移动图形牌桌、服务端额度滑杆和
+前后台横屏恢复，冻结源码为 `8650fce…`，APK SHA-256 为
+`53723b73d8ee411bdea1a2c7a14070c5c465f1ccc5355ad76708a9650263a20f`。
+服务端现已冻结最小权威 AI 填位契约，但 v0.5.1 的 AI 按钮仍只显示“需服务器
+升级”，要到下一轮客户端接线后才能发送命令。旧稳定 EXE 尚未重新打包联机代码；
+双 Android 完整整手/恢复、分阶段结算事件和长期公网入口仍待验收/实现，当前能力
+仍属于朋友局 Alpha。
 
 ## 1. 设计原则
 
@@ -46,6 +56,8 @@ hello
 ping
 room.create
 room.join
+room.ai.fill
+room.ai.clear
 room.ready
 room.start
 room.leave
@@ -136,6 +148,57 @@ legal_actions（只在 viewer 正好是 acting_seat 时出现）
 
 结果可以公开逐池金额、eligible 座位、实际 payout 与赢家，但不能附带未公开牌。
 
+### 6.1 客户端渲染语义
+
+`table.pots[*].amount` 只表示已经归集的主池/边池，`table.seats[*].bet` 表示仍在
+本街桌面的投入。因此客户端显示的实时总底池必须为：
+
+```text
+sum(table.pots[*].amount) + sum(table.seats[*].bet)
+```
+
+例如盲注 5/10 刚投入且尚未归集时，`pots` 可以为 0，但画面必须显示底池 15。
+该公式只用于展示；客户端不得据此改写筹码、下注或结算。
+
+`viewer_seat`、`button_seat`、`acting_seat` 和每个 `seat` 都是稳定的服务端座位号。
+客户端可以为了让本人位于屏幕下方而旋转视觉坐标，但不得修改座位号，也不得在
+动作命令中发送 seat。`legal_actions` 只会出现在当前认证座位正好行动时；字段缺失
+表示当前不可行动，客户端不得自行推导一套合法动作。
+
+座位没有 `cards` 字段表示牌面未授权，图形客户端最多绘制牌背，不能从本地牌局、
+缓存或动画补全。结算叙述只读 `result/pot_awards/winners` 与实际公开的 `cards`。
+当前协议没有 `game.event`，重连后只保证最新权威状态，不保证补播发牌或筹码动画。
+
+### 6.2 房间能力与座位身份
+
+`room.state` 顶层用能力位声明服务器是否支持本节契约：
+
+```json
+"features":{"server_ai_fill":true}
+```
+
+大厅的每个 `seats[*]` 都带 `occupant_type`：真人为 `"HUMAN"`，服务器 AI 为
+`"AI"`，空位为 `null`。只有 AI 座位额外公开稳定的 `persona_id` 与
+`style_key`；例如：
+
+```json
+{
+  "seat":2,
+  "occupied":true,
+  "occupant_type":"AI",
+  "display_name":"狐狸 Foxy",
+  "ready":true,
+  "is_host":false,
+  "persona_id":"fox",
+  "style_key":"LAG"
+}
+```
+
+AI 座位没有 `resume_token`、WebSocket 连接或客户端身份，不能用
+`projection_for_seat` 冒充真人认证。旧客户端必须忽略不认识的 `features`、
+`occupant_type`、`persona_id` 和 `style_key`，因此仍可加入纯真人房；只有显式看到
+`features.server_ai_fill == true` 的新客户端才应开放 AI 填位控件。
+
 ## 7. 房间命令 body
 
 创建房间（当前服务默认只允许一个活跃房间）：
@@ -171,6 +234,8 @@ legal_actions（只在 viewer 正好是 acting_seat 时出现）
 
 ```text
 room.ready     {"ready": true|false}
+room.ai.fill   {}
+room.ai.clear  {}
 room.start     {}
 room.leave     {}
 game.action    见第 3 节
@@ -180,8 +245,13 @@ seat.rebuy     {"amount": 1000}
 seat.leave     {}
 ```
 
-`room.start` 与 `game.next_hand` 仅房主可发；所有人到齐且全部 ready 后才能
-开局。爆仓玩家必须 `seat.rebuy` 或 `seat.leave`，处理完前禁止下一手。
+`room.start`、`game.next_hand`、`room.ai.fill` 与 `room.ai.clear` 仅房主可发。
+两个 AI 命令只允许在 `LOBBY` 使用，并严格要求空 body：`fill` 一次补满当前所有
+空席，`clear` 只移除 AI、绝不触碰真人座位与 token；重复 fill/clear 是不推进版本
+也不广播的 no-op。AI 视为已准备；所有目标座位占满且所有真人 ready 后才能开局。
+成功 ACK 分别在 `result.added_count` / `result.removed_count` 返回实际变更席位数。
+最小 v1 契约不接受数量、指定座位、身份或打法参数，这些都由服务器选择。爆仓真人
+必须 `seat.rebuy` 或 `seat.leave`，处理完前禁止下一手。
 
 ## 8. 已实现的服务端消息
 
@@ -215,6 +285,14 @@ pong          应用层 ping 回复
 `room.state`。错误、缓存重放和 no-op 不广播。恢复连接依次收到 `welcome`
 与最新 `room.state`，不补播旧动画。
 
+真人命令完成 ACK 与该次广播后，服务端 actor 才可启动自动推进。每次只让一个
+AI 从 `table.snapshot(perspective=该 AI 座位)` 选择并执行一个动作；每个真实 AI
+动作各自增加一次 `state_version`，并立即为当前每条真人连接生成独立
+`room.state`。actor 在这些步骤之间保持 mailbox 串行，AI 不会与真人命令、重连
+或离席并发修改牌桌。到真人行动时立即停止；两手之间若有 AI 爆仓，则按房间
+`config.buyin` 每步自动补回一个并独立广播。服务端绝不自动发送
+`game.next_hand` 或 `game.show`，也不会替爆仓真人做决定。
+
 分阶段 `game.event` 尚未实现。当前全下由引擎立即跑码结算，客户端直接收到
 最终权威状态；未来 UI 动画事件应保持：
 
@@ -242,17 +320,54 @@ action → board_runout → showdown_reveal → settlement → bust_pending
 服务固定监听 `127.0.0.1`，这不是手机可直接访问的公网地址。进入朋友公网局
 前必须由 Cloudflare Tunnel 等外层提供 `wss://`；客户端不得关闭证书校验。
 
+也可以使用带本地 health 与 WebSocket hello/ping 冒烟的启动器：
+
+```powershell
+.venv\Scripts\python.exe tools\run_friends_alpha.py --port 8765
+```
+
+默认路径继续是 `/ws`，因此旧客户端和上面的参考 CLI 不需要修改。临时 Tunnel
+应优先使用启动器在进程内生成高熵路径。下面两个直接服务参数只供开发调试，
+其值会留在本机进程命令行或 PowerShell 历史中：
+
+```powershell
+.venv\Scripts\python.exe -m multiplayer_server --path-token REPLACE_WITH_32_CHAR_URL_SAFE_TOKEN
+.venv\Scripts\python.exe -m multiplayer_server --ws-path /ws/REPLACE_WITH_PRIVATE_PATH
+```
+
+`--path-token` 会映射为 `/ws/<token>`。服务只接受配置后的精确路径；默认
+`/ws`、附加 query、编码别名和其他路径都返回 404。私密路径不会出现在普通
+配置 `repr` 或服务启动日志中。`GET /health` 始终保留在公开的 `/health`，只返回
+无房间信息的 `OK` 且禁止缓存，便于 Tunnel 健康检查。
+
+私密路径只是降低随机扫描命中率的临时访问秘密，**不是用户认证、房间认证或
+授权机制**。拿到完整 WSS URL 的人仍可尝试连接；URL 一旦泄露，应停止服务并
+重新生成 Tunnel 与路径。座位身份仍只由第 5 节的房间凭据和 `resume_token`
+确认，且客户端必须继续校验 TLS 证书。
+
+注册表默认在最后一条已绑定连接断开后保留空房 `900` 秒，以允许携带有效
+`resume_token` 的客户端恢复；TTL 内任一合法恢复会取消本轮回收计时。空房持续
+满 900 秒后，服务关闭该房间 actor、清除内存状态并释放单房间名额。可用
+`--empty-room-ttl SECONDS` 调整正有限秒数；服务重启仍会立即丢失所有房间。
+该 TTL 只是全房为空后的内存回收，不是单个掉线玩家的托管或踢出机制。
+
+Windows 本机与 Cloudflare Quick Tunnel 的公开操作边界见
+[`FRIENDS_SERVER_QUICKSTART.md`](FRIENDS_SERVER_QUICKSTART.md)；v1 仅为历史，
+当前 Android 信息见 [`ANDROID_CLIENT.md`](ANDROID_CLIENT.md)。
+
 ## 10. Alpha 运行限制
 
 - 一个服务进程只允许一个活跃房间；多房间前先隔离当前全局随机源。
 - 生产入口不接受 seed、scripted hole 或 scripted board。
 - 房主固定 seat 0，Alpha 期间不能主动离桌；暂不做 sit-out/cash-out/房主迁移。
-- 核心与注册表支持 2–9 真人，当前自动端到端验收以两名真人 HU 为基线；
-  联机 UI 先实现 HU，再逐步开放多人布局。AI 填位后置。
+- 核心、注册表与 Windows 布局支持 2–9 人；Android v0.5.1 已能创建 2–9 真人
+  固定目标房，但多人真机完整整手仍待验收。服务端已提供权威 AI 填位与自动行动，
+  v0.5.1 的 AI 按钮尚未接线，不能把它描述成手机已经可用的功能。
 - 每连接最多 30 条房间命令/秒；超限断开。actor 和传输均使用独立有界出站
   队列，慢客户端不会阻塞牌桌。
 - 服务器重启会结束房间，客户端必须明确提示。
-- 当前没有断线超时托管、房主迁移或服务器重启恢复；这些是公网试用前的后续项。
+- 当前没有单个玩家断线托管、房主迁移或服务器重启恢复；全房为空时仅按默认
+  900 秒 TTL 保留内存态，供有效 token 恢复，超时即回收。
 - 正式服务只监听 `127.0.0.1`，公网由 WSS/Tunnel 提供；任何长期密钥不进代码。
 
 ## 11. 当前稳定错误码
@@ -274,3 +389,4 @@ INVALID_SERVER_MESSAGE
 `STALE_STATE`、`IDEMPOTENCY_CONFLICT`、`NOT_YOUR_TURN`、`ILLEGAL_ACTION`、
 `PHASE_MISMATCH`、`HOST_ONLY`、`HOST_LEAVE_FORBIDDEN`、`BUSTED_PENDING`、
 `PLAYER_HAS_CHIPS`、`INVALID_REBUY`、`SHOW_FORBIDDEN`、`RATE_LIMITED` 等。
+服务器 AI 自动补买还可能返回 `AI_REBUY_LIMIT`。

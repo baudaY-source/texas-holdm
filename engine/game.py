@@ -66,7 +66,8 @@ MAX_REBUY_BB = MAX_BUYIN_BB
 class TableConfig:
     """牌桌配置。
 
-    :param starting_stack: 统一起始筹码,或逐座位筹码元组(测试用)。
+    :param starting_stack: 统一起始筹码，或逐物理座位筹码元组；初始空位
+        在元组中为 0 并同时列入 ``initially_removed``。
     """
 
     player_count: int  # 2-9
@@ -74,6 +75,12 @@ class TableConfig:
     small_blind: int
     big_blind: int
     player_names: tuple[str, ...] | None = None
+    # 固定物理座位中的初始空位。空位筹码必须为 0，开局时不会被压缩编号；
+    # 朋友局可在两手之间通过 ``seat_player`` 把成员安排回来。
+    initially_removed: frozenset[int] = frozenset()
+    # 单机默认保护 0 号真人座位；权威朋友局的房主与座位解耦，因此会
+    # 显式传空集合。该字段只影响 ``remove_player``，不影响投注规则。
+    protected_seats: frozenset[int] = frozenset({0})
     straddle_enabled: bool = field(init=False)
     straddle_amount: int = field(init=False)
 
@@ -127,8 +134,23 @@ class TableConfig:
         )
         if len(stacks) != self.player_count:
             raise ValueError("逐座位筹码数量须与 player_count 一致")
-        if any(s <= 0 for s in stacks):
-            raise ValueError("起始筹码须为正数")
+        if not isinstance(self.initially_removed, frozenset):
+            raise ValueError("initially_removed 须为 frozenset")
+        if not isinstance(self.protected_seats, frozenset):
+            raise ValueError("protected_seats 须为 frozenset")
+        all_seats = set(range(self.player_count))
+        if not self.initially_removed <= all_seats:
+            raise ValueError("initially_removed 含不存在的座位")
+        if not self.protected_seats <= all_seats:
+            raise ValueError("protected_seats 含不存在的座位")
+        if len(all_seats - self.initially_removed) < 2:
+            raise ValueError("初始至少须有两个在座玩家")
+        for seat, stack in enumerate(stacks):
+            if seat in self.initially_removed:
+                if stack != 0:
+                    raise ValueError("初始空位筹码必须为 0")
+            elif stack <= 0:
+                raise ValueError("在座玩家起始筹码须为正数")
         if self.player_names is not None and len(self.player_names) != self.player_count:
             raise ValueError("player_names 数量须与 player_count 一致")
         # 8/9 人模式默认采用一枪 UTG live straddle；字段为派生只读配置，
@@ -195,7 +217,7 @@ class Table:
         self._button_seat: int | None = None
         self._hand_id = 0
         self._state: State | None = None
-        self._removed: set[int] = set()  # 被永久移出的座位
+        self._removed: set[int] = set(config.initially_removed)
         self._chips_added: dict[int, int] = {}  # 座位 -> 累计买入筹码(守恒核算)
         # 以下为本手牌的上下文(start_hand 时重建)
         self._active: list[int] = []
@@ -429,7 +451,7 @@ class Table:
         self._chips_added[seat] = self._chips_added.get(seat, 0) + amount
         self._write_event({"type": "rebuy", "seat": seat, "amount": amount})
 
-    def remove_player(self, seat: int) -> None:
+    def remove_player(self, seat: int, *, allow_game_over: bool = False) -> None:
         """两手之间把一名已出局(筹码归零)的玩家永久移出牌桌。
 
         :raises RuntimeError: 当前有进行中的手牌。
@@ -439,14 +461,46 @@ class Table:
         if not self.hand_over:
             raise RuntimeError("只能在两手之间移出玩家")
         self._check_seat(seat)
-        if seat == 0:
-            raise ValueError("不能移出 0 号座位(人类玩家)")
+        if seat in self.config.protected_seats:
+            raise ValueError(f"座位 {seat} 受保护，不能移出")
         if self._stacks[seat] > 0:
             raise ValueError(f"座位 {seat} 仍有筹码,不能移出")
-        if len(self.active_seats) < 2:
+        if len(self.active_seats) < 2 and not allow_game_over:
             raise GameOverRequiredError("移出后剩余玩家不足两人,应结束整场")
         self._removed.add(seat)
         self._write_event({"type": "remove", "seat": seat})
+
+    def top_up_to(self, seat: int, target_stack: int) -> int:
+        """两手之间把座位码量补到指定目标，返回实际增加额。
+
+        与兼容旧界面的 :meth:`rebuy` 不同，目标栈须位于 10-1000BB，
+        但实际差额可以小于 10BB；这正是联机“下一手前补到目标码量”
+        的金额语义。目标不高于当前栈时不写历史且返回 0。
+        """
+        if not self.hand_over:
+            raise RuntimeError("只能在两手之间补充筹码")
+        self._check_seat(seat)
+        if isinstance(target_stack, bool) or not isinstance(target_stack, int):
+            raise ValueError("目标码量须为整数筹码")
+        lo = MIN_REBUY_BB * self.config.big_blind
+        hi = MAX_REBUY_BB * self.config.big_blind
+        if not lo <= target_stack <= hi:
+            raise ValueError(f"目标码量须在 {lo}-{hi} 之间: {target_stack}")
+        current = self._stacks[seat]
+        if target_stack <= current:
+            return 0
+        delta = target_stack - current
+        self._stacks[seat] = target_stack
+        self._chips_added[seat] = self._chips_added.get(seat, 0) + delta
+        self._write_event(
+            {
+                "type": "top_up",
+                "seat": seat,
+                "amount": delta,
+                "target_stack": target_stack,
+            }
+        )
+        return delta
 
     def seat_player(self, seat: int, amount: int, name: str | None = None) -> None:
         """两手之间把牌手安排进一个已移出的空座位。
@@ -613,6 +667,22 @@ class Table:
         :param perspective: 可选的观察座位;指定后其他在局玩家的底牌
             将被隐藏(摊牌亮出的除外),``None`` 表示全知视角。
         """
+        return self._snapshot_for(perspective=perspective, public_only=False)
+
+    def public_snapshot(self) -> GameSnapshot:
+        """生成无私人底牌、无行动权限的安全公共快照。
+
+        仅保留已经 SHOW 或正常摊牌公开的牌；该入口供未入座成员和暂停
+        旁观者使用，避免先取得全知快照再删字段的泄密风险。
+        """
+        return self._snapshot_for(perspective=None, public_only=True)
+
+    def _snapshot_for(
+        self,
+        *,
+        perspective: int | None,
+        public_only: bool,
+    ) -> GameSnapshot:
         st = self._require_state()
         m = len(self._active)
         labels = position_labels(m)
@@ -645,7 +715,13 @@ class Table:
                 continue
             pk = self._seat_to_pk[seat]
             folded = seat in self._folded
-            hole = self._visible_hole(seat, folded, perspective, over)
+            hole = self._visible_hole(
+                seat,
+                folded,
+                perspective,
+                over,
+                public_only=public_only,
+            )
             offset = (self._active.index(seat) - j) % m
             players.append(
                 PlayerState(
@@ -673,14 +749,24 @@ class Table:
             players=tuple(players),
             acting_seat=acting_seat,
             button_seat=self._button_seat,  # type: ignore[arg-type]
-            legal_actions=self._legal_actions() if acting_seat is not None else None,
+            legal_actions=(
+                self._legal_actions()
+                if acting_seat is not None and not public_only
+                else None
+            ),
         )
 
     def _visible_hole(
-        self, seat: int, folded: bool, perspective: int | None, over: bool
+        self,
+        seat: int,
+        folded: bool,
+        perspective: int | None,
+        over: bool,
+        *,
+        public_only: bool = False,
     ) -> tuple[str, ...] | None:
         """按视角决定底牌可见性。"""
-        if perspective is None or seat == perspective:
+        if not public_only and (perspective is None or seat == perspective):
             return self._hole.get(seat)
         if seat in self._shown_seats:
             return self._hole.get(seat)

@@ -1,8 +1,9 @@
 """联机牌桌状态的安全投影。
 
 本模块是引擎与未来网络传输之间的唯一安全边界：每次投影都先
-请求 ``Table.snapshot(perspective=viewer_seat)``，再逐字段构造可 JSON
-序列化的公开状态。禁止先序列化全知对象再删敏感字段。
+已入座者请求 ``Table.snapshot(perspective=viewer_seat)``，未入座者请求
+``Table.public_snapshot()``，再逐字段构造可 JSON 序列化状态。禁止先
+取得或序列化全知对象再删敏感字段。
 """
 from __future__ import annotations
 
@@ -54,13 +55,13 @@ _ACTION_WIRE = {
 def project_table_state(
     table: Table,
     *,
-    viewer_seat: int,
+    viewer_seat: int | None,
     room: str,
     state_version: int,
 ) -> dict[str, object]:
     """为一个座位生成可发送的牌桌状态。
 
-    ``legal_actions`` 只在该观众正好是当前行动者时出现。
+    ``legal_actions`` 只在已入座观众正好是当前行动者时出现。
     座位牌只使用 ``cards`` 输出，且仅当视角快照已经允许看见
     时才添加该字段；隐藏牌不使用占位值，以免误传内部契约。
     """
@@ -70,12 +71,19 @@ def project_table_state(
         raise ValueError("state_version 须为非负整数")
     if state_version < 0:
         raise ValueError("state_version 须为非负整数")
-    if isinstance(viewer_seat, bool) or not isinstance(viewer_seat, int):
-        raise ValueError("viewer_seat 须为整数")
+    if viewer_seat is not None and (
+        isinstance(viewer_seat, bool) or not isinstance(viewer_seat, int)
+    ):
+        raise ValueError("viewer_seat 须为整数或 None")
 
-    # 安全性核心：绝不请求全知 snapshot，也不读取历史内部记录。
-    snapshot = table.snapshot(perspective=viewer_seat)
-    if not 0 <= viewer_seat < len(snapshot.players):
+    # 安全性核心：未入座者走引擎专用公共视角，绝不请求全知 snapshot
+    # 后删除私牌；已入座者仍只请求其认证座位的 perspective。
+    snapshot = (
+        table.public_snapshot()
+        if viewer_seat is None
+        else table.snapshot(perspective=viewer_seat)
+    )
+    if viewer_seat is not None and not 0 <= viewer_seat < len(snapshot.players):
         raise ValueError(f"座位不存在: {viewer_seat}")
 
     straddle_amount = table.current_straddle_amount
@@ -115,7 +123,11 @@ def project_table_state(
         "shown": sorted(table.shown_seats),
         "result": projected_result,
     }
-    if viewer_seat == snapshot.acting_seat and snapshot.legal_actions is not None:
+    if (
+        viewer_seat is not None
+        and viewer_seat == snapshot.acting_seat
+        and snapshot.legal_actions is not None
+    ):
         payload["legal_actions"] = _project_legal_actions(snapshot.legal_actions)
     return payload
 

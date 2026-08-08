@@ -37,3 +37,17 @@ wsl_android_start/
 # 本地稳定版归档（大文件不进 Git）
 release/
 local_backups/
+
+# 公开部署仓库硬边界：内部代理说明、训练环境与移动端产物不得提交
+AGENTS.md
+memory.md
+nets/
+*.apk
+*.aab
+*.pt
+*.pth
+*.ckpt
+.env*
+*.pem
+*.key
+cloudflared*.exe
